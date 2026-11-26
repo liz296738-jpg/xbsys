@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>教师选班系统</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="toast-wrap" id="toasts"></div>
+
+<div class="header">
+  <h1>教师选班系统 <span>选择授课班级</span></h1>
+  <div class="right">
+    <span class="muted" id="who"></span>
+    <button class="btn sm" id="switchCourseBtn" style="display:none">切换课程</button>
+    <button class="btn sm" id="switchBtn" style="display:none">切换教师</button>
+    <a class="btn sm" href="/admin">管理端</a>
+  </div>
+</div>
+
+<div id="loginBox" class="login" style="display:none">
+  <div class="card">
+    <div class="card-body">
+      <h2>教师登录</h2>
+      <p>工号与姓名两项都要填，且必须与课程管理员导入的名单完全一致才能进入</p>
+      <div class="row">
+        <input type="text" id="noInput" placeholder="工号（必填，如 1020180078）" maxlength="30" style="width:300px" required>
+        <input type="text" id="nameInput" placeholder="姓名（必填），例如：张老师" maxlength="20" required>
+        <button class="btn primary" id="enterBtn">进入</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="courseBox" class="login" style="display:none">
+  <div class="card">
+    <div class="card-body">
+      <h2>请选择要进入的课程</h2>
+      <p id="courseTip">您在以下课程中承担选班任务，选择后进入该课程的选班界面</p>
+      <div id="courseList" style="display:flex;gap:10px;flex-wrap:wrap"></div>
+    </div>
+  </div>
+</div>
+
+<div class="wrap" id="mainBox" style="display:none">
+  <div class="hint" id="ruleHint"></div>
+  <div class="layout">
+    <div class="card">
+      <div class="card-head">
+        <h2>可选班级</h2>
+        <div class="toolbar">
+          <input type="text" id="q" placeholder="搜索班级名 / 专业简称" style="width:190px">
+          <select id="sort">
+            <option value="name">按班级名</option>
+            <option value="major">按专业</option>
+            <option value="grade">按年级</option>
+            <option value="size">按人数</option>
+          </select>
+          <select id="order">
+            <option value="asc">升序</option>
+            <option value="desc">降序</option>
+          </select>
+          <button class="btn" id="refreshBtn">刷新</button>
+        </div>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:38px"><input type="checkbox" id="checkAll"></th>
+              <th>班级</th><th>专业简称</th><th>学院</th><th>年级</th><th>校区</th>
+              <th class="num">计划人数</th><th class="num">已选/上限</th>
+            </tr>
+          </thead>
+          <tbody id="classBody"></tbody>
+        </table>
+        <div class="empty" id="classEmpty" style="display:none">没有符合条件的班级</div>
+      </div>
+      <div class="submit-bar">
+        <div class="info">已勾选 <b id="pickCount">0</b> 个班，合计 <b id="pickPeople">0</b> 人</div>
+        <div class="toolbar">
+          <input type="text" id="noteInput" placeholder="排课备注（可选）" style="width:210px">
+          <button class="btn primary" id="submitBtn" disabled>提交选班</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>我的选班</h2>
+        <span class="muted" id="mineStats"></span>
+      </div>
+      <div class="card-body" style="padding:12px 16px 4px">
+        <div class="stat" style="margin-bottom:12px">
+          <div class="item"><div class="k">已选班级</div><div class="v" id="myClasses">0</div></div>
+          <div class="item"><div class="k">合计人数</div><div class="v" id="myPeople">0</div></div>
+        </div>
+        <div id="mineList"></div>
+        <div class="empty" id="mineEmpty" style="display:none">还没有选择任何班级</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/teacher.js"></script>
+</body>
+</html>

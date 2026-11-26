@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>教师选班系统 - 管理端</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="toast-wrap" id="toasts"></div>
+
+<div class="header">
+  <h1>教师选班系统 <span>管理端</span></h1>
+  <div class="right">
+    <span class="muted" id="who"></span>
+    <button class="btn sm" id="switchCourseBtn" style="display:none">切换课程</button>
+    <button class="btn sm" id="logoutBtn" style="display:none">退出登录</button>
+    <a class="btn sm" href="/">教师端</a>
+  </div>
+</div>
+
+<!-- 课程登录 -->
+<div id="loginBox" class="login" style="display:none;max-width:780px">
+  <div class="card">
+    <div class="card-body">
+      <h2>课程登录</h2>
+      <p>输入课程号与课程名称进入该课程的选班管理。课程号首次登录时自动建档；再次登录同一课程号会回到该课程界面。</p>
+      <div class="row">
+        <input type="text" id="courseNoInput" placeholder="课程号，例如：2025" maxlength="30" style="width:190px">
+        <input type="text" id="courseNameInput" placeholder="课程名称，例如：2025级专业班级选班" maxlength="40" style="width:300px">
+        <button class="btn primary" id="enterBtn">进入课程</button>
+      </div>
+      <div id="quickCourses" style="margin-top:14px"></div>
+    </div>
+  </div>
+</div>
+
+<div class="wrap" id="mainBox" style="display:none">
+  <div class="course-bar">
+    <div><b id="courseTitle">-</b> <span class="tag blue" id="courseNoTag">-</span></div>
+    <div class="muted" id="courseMeta"></div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-panel="overview">选班总览</div>
+    <div class="tab" data-panel="teachers">教师选班情况</div>
+    <div class="tab" data-panel="import">名单与班级导入</div>
+    <div class="tab" data-panel="caps">人数上下限</div>
+    <div class="tab" data-panel="export">导出与重置</div>
+  </div>
+
+  <!-- 总览 -->
+  <div class="panel active" id="panel-overview">
+    <div class="stat" style="margin-bottom:14px">
+      <div class="item"><div class="k">班级总数</div><div class="v" id="s-classes">-</div></div>
+      <div class="item"><div class="k">已被选</div><div class="v" id="s-selected">-</div></div>
+      <div class="item"><div class="k">未被选</div><div class="v" id="s-left">-</div></div>
+      <div class="item"><div class="k">学生总数</div><div class="v" id="s-students">-</div></div>
+      <div class="item"><div class="k">已覆盖学生</div><div class="v" id="s-selstud">-</div></div>
+      <div class="item"><div class="k">未达下限班级</div><div class="v" id="s-below">-</div></div>
+      <div class="item"><div class="k">名单教师</div><div class="v" id="s-teachers">-</div></div>
+      <div class="item unsel"><div class="k">未选班教师</div><div class="v" id="s-unsel">-</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-head">
+        <h2>教师选班汇总</h2>
+        <div class="toolbar">
+          <select id="teacherFilter">
+            <option value="all">全部教师</option>
+            <option value="unselected">仅未选班</option>
+            <option value="selected">仅已选班</option>
+          </select>
+          <button class="btn sm" id="refreshBtn">刷新</button>
+        </div>
+      </div>
+      <div class="scroll" style="max-height:320px">
+        <table>
+          <thead><tr><th>工号</th><th>教师</th><th class="num">已选班级</th><th class="num">合计人数</th><th>状态</th></tr></thead>
+          <tbody id="teacherBody"></tbody>
+        </table>
+        <div class="empty" id="teacherEmpty" style="display:none">本课程还没有名单教师，请先在「名单与班级导入」页导入选班教师名单</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>班级选班明细</h2>
+        <div class="toolbar">
+          <select id="filter">
+            <option value="all">全部班级</option>
+            <option value="selected">已被选</option>
+            <option value="free">未被选</option>
+            <option value="below">未达下限</option>
+          </select>
+          <input type="text" id="aq" placeholder="搜索班级 / 专业" style="width:170px">
+        </div>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>校区</th><th>班级</th><th>专业简称</th><th>学院</th><th>年级</th>
+            <th class="num">计划人数</th><th class="num">已选/上限</th><th>教师</th><th>排课备注</th></tr>
+          </thead>
+          <tbody id="classBody"></tbody>
+        </table>
+        <div class="pager" id="pager"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 教师选班情况 -->
+  <div class="panel" id="panel-teachers">
+    <div class="two-col">
+      <div class="card">
+        <div class="card-head">
+          <h2>名单教师</h2>
+          <div class="toolbar">
+            <input type="text" id="tSearch" placeholder="搜索姓名 / 工号" style="width:160px">
+            <select id="tFilter">
+              <option value="all">全部</option>
+              <option value="unselected">仅未选班</option>
+              <option value="selected">仅已选班</option>
+            </select>
+          </div>
+        </div>
+        <div class="scroll" style="max-height:560px">
+          <table>
+            <thead><tr><th>工号</th><th>教师</th><th class="num">班级</th><th class="num">人数</th><th>状态</th></tr></thead>
+            <tbody id="tListBody"></tbody>
+          </table>
+          <div class="empty" id="tListEmpty" style="display:none">没有符合条件的教师</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2 id="tDetailTitle">教师选班明细</h2>
+          <span class="muted" id="tDetailStats"></span>
+          <button class="btn sm danger" id="tRemoveBtn" style="display:none">移出本课程名单</button>
+        </div>
+        <div class="card-body">
+          <div id="tDetail"></div>
+          <div class="empty" id="tDetailEmpty">点击左侧教师，查看该教师选择了哪些班级；未选班的教师会显示“尚未选班”</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-head">
+        <h2>最近登录尝试</h2>
+        <span class="muted">教师说“我明明填了工号和姓名却进不去”时，先看这里</span>
+        <button class="btn sm" id="loginLogBtn">刷新记录</button>
+      </div>
+      <div class="scroll" style="max-height:260px">
+        <table>
+          <thead><tr><th>时间</th><th>输入的工号</th><th>输入的姓名</th><th>结果</th><th>匹配到的教师</th></tr></thead>
+          <tbody id="loginLogBody"></tbody>
+        </table>
+        <div class="empty" id="loginLogEmpty" style="display:none">还没有登录记录</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-import">
+    <div class="card">
+      <div class="card-head"><h2>导入专业班级（本课程）</h2></div>
+      <div class="card-body">
+        <div class="hint">
+          表头需要包含：<b>学院、班级、计划人数、专业简称、年级、校区</b>（「实际上课人数」「人数」也会被识别为计划人数）。
+          支持 .xlsx 与 .csv，同一文件中重复的班级会提示跳过。导入的班级只属于当前课程。
+        </div>
+        <div class="toolbar" style="margin-bottom:12px">
+          <input type="file" id="fileInput" accept=".xlsx,.xlsm,.csv">
+          <select id="importMode">
+            <option value="skip">重复班级跳过</option>
+            <option value="overwrite">重复班级覆盖人数等信息</option>
+          </select>
+          <button class="btn primary" id="importBtn">开始导入</button>
+          <button class="btn" id="templateBtn">下载班级模板</button>
+        </div>
+        <div id="importResult"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><h2>导入选班教师名单（本课程）</h2></div>
+      <div class="card-body">
+        <div class="hint">
+          表头需要包含：<b>姓名</b>、<b>工号</b>，两项都必填（教师登录时工号与姓名必须同时匹配，没有工号的教师无法登录）。
+          在本课程界面导入后，这些教师即自动加入本课程名单；即使还没选班，也会出现在总览、教师选班情况与导出结果中。
+        </div>
+        <div class="toolbar" style="margin-bottom:12px">
+          <input type="file" id="teacherFile" accept=".xlsx,.xlsm,.csv">
+          <select id="teacherMode">
+            <option value="skip">重复教师跳过</option>
+            <option value="overwrite">重复教师标记为名单内</option>
+          </select>
+          <button class="btn primary" id="importTeacherBtn">开始导入</button>
+          <button class="btn" id="teacherTemplateBtn">下载教师名单模板</button>
+          <button class="btn" id="teacherExportBtn">导出本课程教师名单</button>
+        </div>
+        <div class="toolbar" style="margin-bottom:6px">
+          <span class="muted">单个添加：</span>
+          <input type="text" id="newTeacherNo" placeholder="工号（必填）" maxlength="20" style="width:150px">
+          <input type="text" id="newTeacherName" placeholder="教师姓名（必填）" maxlength="20" style="width:160px">
+          <button class="btn primary" id="addTeacherBtn">添加教师</button>
+          <span class="muted">添加后即加入本课程名单，教师用工号+姓名登录</span>
+        </div>
+        <div id="addTeacherResult"></div>
+        <div id="teacherImportResult"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 上下限 -->
+  <div class="panel" id="panel-caps">
+    <div class="card">
+      <div class="card-head"><h2>选班人数上下限</h2></div>
+      <div class="card-body">
+        <div class="hint">
+          「上限」= 一个班最多可被几位教师选（默认 1，即排他）；「下限」= 该班至少需要几位教师选，低于下限会在总览里标黄提示。
+        </div>
+        <div class="toolbar" style="margin-bottom:14px">
+          <span class="muted">统一设置：</span>
+          上限 <input type="number" id="allCap" value="1" min="1" max="20" style="width:70px">
+          下限 <input type="number" id="allMin" value="1" min="0" max="20" style="width:70px">
+          <button class="btn primary" id="applyAllBtn">应用到全部班级</button>
+          <span class="muted">|</span>
+          <button class="btn" id="applySelBtn">应用到勾选的班级</button>
+          <button class="btn primary" id="saveCapsBtn">保存逐班改动</button>
+          <span class="muted" id="capSelInfo"></span>
+        </div>
+        <div class="toolbar" style="margin-bottom:12px">
+          <span class="muted">教师规则：</span>
+          每位教师最多 <input type="number" id="maxStudents" value="100" min="0" style="width:80px"> 人（0=不限）
+          至少 <input type="number" id="minClasses" value="2" min="0" style="width:70px"> 个班
+          <button class="btn primary" id="saveRuleBtn">保存规则</button>
+        </div>
+        <div class="scroll" style="max-height:440px">
+          <table>
+            <thead>
+              <tr><th style="width:36px"><input type="checkbox" id="capAll"></th>
+              <th>班级</th><th>专业简称</th><th>校区</th>
+              <th class="num">计划人数</th><th class="num">上限</th><th class="num">下限</th></tr>
+            </thead>
+            <tbody id="capBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 导出与重置 -->
+  <div class="panel" id="panel-export">
+    <div class="card">
+      <div class="card-head"><h2>导出本课程选班结果</h2></div>
+      <div class="card-body">
+        <p class="muted">导出的 Excel 包含四张表：选班明细（含排课备注）、未选班级、教师汇总（含状态）、未选班教师名单。</p>
+        <div class="toolbar" style="margin-bottom:24px">
+          <button class="btn primary" id="exportBtn">导出 Excel</button>
+        </div>
+        <div class="hint">以下操作只影响当前课程，请谨慎使用。清空选班只删除选班记录，班级和教师名单保留。</div>
+        <div class="toolbar">
+          <button class="btn danger" id="resetBtn">清空本课程选班记录</button>
+          <button class="btn danger" id="resetCourseBtn">清空本课程班级与教师名单</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/admin.js"></script>
+</body>
+</html>
