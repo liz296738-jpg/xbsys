@@ -12,14 +12,19 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-port = int(os.environ.get("PORT", 8765))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, '选班系统.db')
+DB_PATH = os.environ.get('JXB_DB') or os.path.join(BASE_DIR, '选班系统.db')
 SEED_XLSX = os.path.join(BASE_DIR, '测试数据.xlsx')
-HOST, PORT = '0.0.0.0', port
+# 部署成网站时：JXB_HOST=0.0.0.0 让所有网卡/内网都能访问；JXB_PORT 改端口
+HOST = os.environ.get('JXB_HOST', '127.0.0.1')
+PORT = int(os.environ.get('PORT') or os.environ.get('JXB_PORT', '8765'))
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+if DATABASE_URL:
+    HOST = '0.0.0.0'
 
 LOCK = threading.Lock()
-CONN = None
+_LOCAL = threading.local()
+_SCHEMA_READY = False
 
 DEFAULT_COURSE_NO = '2025'
 DEFAULT_COURSE_NAME = '2025级专业班级选班'
@@ -83,6 +88,11 @@ CREATE TABLE IF NOT EXISTS sessions(
     teacher_id INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS admin_sessions(
+    token TEXT PRIMARY KEY,
+    course_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_sel_class ON selections(class_id);
 CREATE INDEX IF NOT EXISTS idx_sel_teacher ON selections(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_cls_course ON classes(course_id);
@@ -96,16 +106,46 @@ DEFAULT_SETTINGS = {
 
 
 def db():
-    global CONN
-    if CONN is None:
-        CONN = sqlite3.connect(DB_PATH, check_same_thread=False)
-        CONN.row_factory = sqlite3.Row
-        CONN.execute('PRAGMA journal_mode=WAL')
-        CONN.executescript(SCHEMA)
-        for k, v in DEFAULT_SETTINGS.items():
-            CONN.execute('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)', (k, v))
-        CONN.commit()
-    return CONN
+    """每个线程一个数据库连接：多人并发在线时互不干扰"""
+    conn = getattr(_LOCAL, 'conn', None)
+    if conn is None:
+        if DATABASE_URL:
+            from postgres_backend import Connection
+            conn = Connection(DATABASE_URL)
+        else:
+            conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA busy_timeout=30000')
+            conn.execute('PRAGMA synchronous=NORMAL')
+        _LOCAL.conn = conn
+        init_schema(conn)
+    elif not getattr(_LOCAL, 'ready', False):
+        init_schema(conn)
+    _LOCAL.ready = True
+    return conn
+
+
+def init_schema(conn):
+    """建表 + 默认设置；多线程并发首次调用时加锁只执行一次"""
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    with LOCK:
+        if _SCHEMA_READY:
+            return
+        try:
+            if DATABASE_URL:
+                conn.execute('SELECT 1 FROM settings LIMIT 1')
+            else:
+                conn.executescript(SCHEMA)
+            for k, v in DEFAULT_SETTINGS.items():
+                conn.execute('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)', (k, v))
+            conn.commit()
+            _SCHEMA_READY = True
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def now_str():
@@ -296,6 +336,11 @@ def log_login(employee_no, name, ok, detail, matched=''):
         rec = {'time': now_str(), 'input_no': str(employee_no or ''),
                'input_name': str(name or ''), 'ok': bool(ok),
                'matched': matched, 'detail': str(detail or '')}
+        if DATABASE_URL:
+            db().execute('INSERT INTO login_events(payload) VALUES(?)',
+                         (json.dumps(rec, ensure_ascii=False),))
+            db().commit()
+            return
         with open(LOGIN_LOG, 'a', encoding='utf-8') as f:
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
         if os.path.getsize(LOGIN_LOG) > 2 * 1024 * 1024:
@@ -308,6 +353,9 @@ def log_login(employee_no, name, ok, detail, matched=''):
 
 
 def recent_logins(limit=30):
+    if DATABASE_URL:
+        return [json.loads(r['payload']) for r in db().execute(
+            'SELECT payload FROM login_events ORDER BY id DESC LIMIT ?', (limit,)).fetchall()]
     if not os.path.exists(LOGIN_LOG):
         return []
     try:
@@ -375,13 +423,109 @@ def resolve_teacher(payload):
     return find_teacher(payload.get('employee_no'), payload.get('name'))
 
 
-def admin_login(course_no, course_name):
+def _hash_password(password, salt=None):
+    import hashlib
+    salt = salt or os.urandom(16).hex()
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 120000)
+    return 'pbkdf2$%s$%s' % (salt, dk.hex())
+
+
+def _check_password(password, stored):
+    import hmac
+    try:
+        algo, salt, h = stored.split('$')
+    except Exception:
+        return False
+    calc = _hash_password(password, salt).split('$')[-1]
+    return hmac.compare_digest(calc, h)
+
+
+_FAILD = {}
+_FAILD_LOCK = threading.Lock()
+
+
+def _throttle_check(ip):
+    with _FAILD_LOCK:
+        rec = _FAILD.get(ip)
+        if not rec:
+            return
+        cnt, ts = rec
+        if cnt >= 8 and (datetime.now() - ts).total_seconds() < 300:
+            raise BizError('密码错误次数过多，请 5 分钟后再试')
+
+
+def _throttle_fail(ip):
+    with _FAILD_LOCK:
+        cnt, _ts = _FAILD.get(ip, (0, datetime.now()))
+        _FAILD[ip] = (cnt + 1, datetime.now())
+
+
+def _throttle_ok(ip):
+    with _FAILD_LOCK:
+        _FAILD.pop(ip, None)
+
+
+def admin_password_set():
+    row = db().execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()
+    return bool(row and row['value'])
+
+
+def set_admin_password(password):
+    db().execute("INSERT INTO settings(key, value) VALUES('admin_password', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_hash_password(password),))
+    db().commit()
+
+
+def issue_admin_token(course_id):
+    import uuid
+    token = uuid.uuid4().hex
+    with LOCK:
+        db().execute('INSERT INTO admin_sessions(token, course_id, created_at) VALUES(?,?,?)',
+                     (token, course_id, now_str()))
+        db().commit()
+    return token
+
+
+def require_admin(course_no, token):
+    """管理端鉴权：必须持有登录时发放的管理员凭证，且只对当门课程有效"""
+    no = (course_no or '').strip()
+    if not no:
+        raise BizError('缺少课程号')
+    tk = str(token or '').strip()
+    if not tk:
+        raise BizError('管理端登录已失效，请重新登录')
+    c = db().execute('SELECT * FROM courses WHERE course_no=?', (no,)).fetchone()
+    if not c:
+        raise BizError('课程不存在')
+    row = db().execute('SELECT 1 FROM admin_sessions WHERE token=? AND course_id=?',
+                       (tk, c['id'])).fetchone()
+    if not row:
+        raise BizError('管理端登录已失效或无权访问该课程，请重新登录')
+    return c
+
+
+def admin_login(course_no, course_name, password='', ip=''):
     no = (course_no or '').strip()
     nm = (course_name or '').strip()
+    pwd = str(password or '')
     if not no:
         raise BizError('请填写课程号')
     if not nm:
         raise BizError('请填写课程名称')
+    _throttle_check(ip)
+    if admin_password_set():
+        if not pwd:
+            raise BizError('请输入管理员密码')
+        stored = db().execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()['value']
+        if not _check_password(pwd, stored):
+            _throttle_fail(ip)
+            raise BizError('管理员密码不正确')
+        first_time = False
+    else:
+        if len(pwd) < 8:
+            raise BizError('这是首次使用，请设置管理员密码（至少 8 位）：本次输入的密码将作为管理员密码')
+        set_admin_password(pwd)
+        first_time = True
     row = db().execute('SELECT * FROM courses WHERE course_no=?', (no,)).fetchone()
     with LOCK:
         if row:
@@ -395,10 +539,12 @@ def admin_login(course_no, course_name):
                                (no, nm, now_str(), now_str()))
             db().commit()
             cid = cur.lastrowid
+    _throttle_ok(ip)
     c = db().execute('SELECT * FROM courses WHERE id=?', (cid,)).fetchone()
     return {'course': {'id': c['id'], 'course_no': c['course_no'], 'name': c['name']},
             **course_stats(cid), 'settings': current_settings(),
-            'created': row is None}
+            'created': row is None, 'admin_token': issue_admin_token(cid),
+            'password_first_set': first_time}
 
 
 def current_settings():
@@ -513,6 +659,8 @@ def select_classes(course_no, employee_no, name, ids, note='', token=''):
     max_students = get_setting('teacher_max_students')
     min_classes = get_setting('teacher_min_classes')
     with LOCK:
+        if DATABASE_URL:
+            db().execute('SELECT pg_advisory_xact_lock(20261126)')
         mine = db().execute(
             'SELECT COUNT(*) n, COALESCE(SUM(cl.plan_size),0) s FROM selections s '
             'JOIN classes cl ON cl.id=s.class_id WHERE s.course_id=? AND s.teacher_id=?',
@@ -1035,6 +1183,16 @@ def parse_multipart(body, boundary):
 class Handler(BaseHTTPRequestHandler):
     server_version = 'ClassPick/2.0'
 
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            conn = getattr(_LOCAL, 'conn', None)
+            if conn is not None:
+                conn.rollback()
+                conn.close()
+                _LOCAL.conn = None
+
     def log_message(self, fmt, *args):
         pass
 
@@ -1044,6 +1202,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
         self.send_header('Pragma', 'no-cache')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'SAMEORIGIN')
+        self.send_header('Referrer-Policy', 'same-origin')
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1051,6 +1212,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, data, code=200):
         self._send(code, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+    def client_ip(self):
+        """nginx 反代时取真实客户端 IP（仅用于登录失败限流，伪造无实际收益）"""
+        xff = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+        return xff or (self.client_address[0] if self.client_address else '?')
 
     def _err(self, msg, code=400):
         self._json({'ok': False, 'error': msg}, code)
@@ -1073,6 +1239,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         path, qs = u.path, parse_qs(u.query)
         try:
+            if path == '/healthz':
+                db().execute('SELECT 1').fetchone()
+                return self._json({'ok': True})
             if path in ('/', '/index.html'):
                 return self._file('index.html')
             if path == '/admin':
@@ -1092,6 +1261,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         path = u.path
         length = int(self.headers.get('Content-Length') or 0)
+        if length > 32 * 1024 * 1024:
+            return self._err('上传内容过大（上限 32MB）', 413)
         ctype = self.headers.get('Content-Type') or ''
         body = self.rfile.read(length) if length else b''
         files = {}
@@ -1115,11 +1286,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_get(self, path, qs):
         if path == '/api/admin/courses':
-            return self._json({'ok': True, 'courses': list_courses(), 'settings': current_settings()})
+            return self._json({'ok': True, 'courses': list_courses(), 'settings': current_settings(),
+                               'password_set': admin_password_set()})
         if path == '/api/admin/overview':
+            require_admin(self.g(qs, 'course_no'), self.g(qs, 'admin_token'))
             return self._json({'ok': True, **admin_overview(self.g(qs, 'course_no'))})
         if path == '/api/export':
             no = self.g(qs, 'course_no')
+            require_admin(no, self.g(qs, 'admin_token'))
             return self._xlsx(export_result(no), '选班结果-%s.xlsx' % no)
         if path == '/api/admin/template':
             return self._xlsx(export_classes_template(), '专业班级导入模板.xlsx')
@@ -1127,6 +1301,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._xlsx(export_teachers_template(), '选班教师名单模板.xlsx')
         if path == '/api/admin/teacher_export':
             no = self.g(qs, 'course_no')
+            require_admin(no, self.g(qs, 'admin_token'))
             return self._xlsx(export_teachers_list(no), '选班教师名单-%s.xlsx' % no)
         if path == '/api/teacher/classes':
             return self._json({'ok': True, **available_classes(
@@ -1136,16 +1311,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'ok': True, **my_selections(
                 self.g(qs, 'course_no'), self.g(qs, 'no'), self.g(qs, 'name'), self.g(qs, 'token'))})
         if path == '/api/admin/login_log':
+            require_admin(self.g(qs, 'course_no'), self.g(qs, 'admin_token'))
             return self._json({'ok': True, 'items': recent_logins(30)})
         if path == '/api/health':
-            return self._json({'ok': True, 'courses': db().execute('SELECT COUNT(*) c FROM courses').fetchone()['c'],
-                               'classes': db().execute('SELECT COUNT(*) c FROM classes').fetchone()['c'],
-                               'teachers': db().execute('SELECT COUNT(*) c FROM teachers').fetchone()['c']})
+            return self._json({'ok': True})
         return self._err('未知接口', 404)
 
     def _api_post(self, path, payload, files):
         if path == '/api/admin/login':
-            return self._json({'ok': True, **admin_login(payload.get('course_no'), payload.get('course_name'))})
+            return self._json({'ok': True, **admin_login(
+                payload.get('course_no'), payload.get('course_name'),
+                payload.get('password'), self.client_ip())})
+        if path == '/api/admin/password':
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
+            old = str(payload.get('old_password') or '')
+            new = str(payload.get('new_password') or '')
+            stored = db().execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()['value']
+            if not _check_password(old, stored):
+                raise BizError('原密码不正确')
+            if len(new) < 8:
+                raise BizError('新密码至少 8 位')
+            set_admin_password(new)
+            return self._json({'ok': True, 'message': '管理员密码已更新，其他已登录的管理端会话需重新登录'})
         if path == '/api/teacher/login':
             return self._json({'ok': True, **teacher_login(payload.get('employee_no'), payload.get('name'))})
         if path == '/api/teacher/select':
@@ -1163,11 +1350,13 @@ class Handler(BaseHTTPRequestHandler):
                 payload.get('course_no'), payload.get('employee_no'), payload.get('name'),
                 int(payload.get('class_id')), payload.get('note', ''), payload.get('token'))})
         if path == '/api/admin/caps':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             ids = [int(i) for i in payload.get('ids', []) if str(i).isdigit()]
             return self._json({'ok': True, **set_caps(
                 payload.get('course_no'), ids, payload.get('cap'), payload.get('min_need', 0),
                 items=payload.get('items')) })
         if path == '/api/admin/settings':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             key = payload.get('key')
             if key not in DEFAULT_SETTINGS:
                 raise BizError('未知设置项')
@@ -1175,6 +1364,7 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
             return self._json({'ok': True})
         if path == '/api/admin/import':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             f = files.get('file')
             if not f:
                 raise BizError('请选择要导入的文件')
@@ -1182,6 +1372,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'ok': True, **import_classes(
                 payload.get('course_no'), rows, payload.get('mode', 'skip'))})
         if path == '/api/admin/import_teachers':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             f = files.get('file')
             if not f:
                 raise BizError('请选择要导入的文件')
@@ -1189,32 +1380,83 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'ok': True, **import_teachers(
                 payload.get('course_no'), rows, payload.get('mode', 'skip'))})
         if path == '/api/admin/add_teacher':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **add_teacher(
                 payload.get('course_no'), payload.get('employee_no'), payload.get('name'))})
         if path == '/api/admin/remove_teacher':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **remove_teacher(
                 payload.get('course_no'), payload.get('teacher_id'))})
         if path == '/api/admin/reset':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **reset_course_selections(payload.get('course_no'))})
         if path == '/api/admin/reset_course':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **reset_course(payload.get('course_no'))})
         if path == '/api/admin/reset_all':
+            require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **reset_all()})
         return self._err('未知接口', 404)
 
 
+class Server(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 128
+
+
+def lan_ip():
+    """取本机在内网/公网可访问的地址，方便把网址发给老师"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return ''
+
+
 def main():
     import sys
+    global HOST, PORT
+    if '--set-password' in sys.argv:
+        idx = sys.argv.index('--set-password')
+        pwd = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ''
+        if len(pwd) < 8:
+            print('管理员密码至少 8 位')
+            return
+        set_admin_password(pwd)
+        print('管理员密码已更新')
+        return
+    for flag, name in (('--host', 'HOST'), ('--port', 'PORT')):
+        if flag in sys.argv:
+            idx = sys.argv.index(flag)
+            val = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ''
+            if name == 'HOST' and val:
+                HOST = val
+            elif name == 'PORT' and val.isdigit():
+                PORT = int(val)
     n = seed_default_course()
     if n:
         print('[init] 已创建默认课程 %s 并导入 %d 个班级' % (DEFAULT_COURSE_NO, n))
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    url = 'http://%s:%d' % (HOST, PORT)
-    print('教师选班系统已启动： %s   （管理端 %s/admin）' % (url, url))
+    srv = Server((HOST, PORT), Handler)
+    local = 'http://127.0.0.1:%d' % PORT
+    print('教师选班系统已启动： %s   （管理端 %s/admin）' % (local, local))
+    if HOST in ('0.0.0.0', '', '::'):
+        ip = lan_ip()
+        if ip:
+            print('对外访问地址： http://%s:%d   （同一网络的电脑/手机直接输这个地址）' % (ip, PORT))
+    print('管理员密码：%s' % ('已设置' if admin_password_set() else '未设置（首次登录时设置）'))
     print('按 Ctrl+C 停止服务')
     if '--open' in sys.argv:
         import webbrowser
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        threading.Timer(1.0, lambda: webbrowser.open(local)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

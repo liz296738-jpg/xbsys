@@ -23,12 +23,14 @@
   <div class="card">
     <div class="card-body">
       <h2>课程登录</h2>
-      <p>输入课程号与课程名称进入该课程的选班管理。课程号首次登录时自动建档；再次登录同一课程号会回到该课程界面。</p>
+      <p>输入课程号、课程名称和管理员密码进入该课程的选班管理。课程号首次登录时自动建档；再次登录同一课程号会回到该课程界面。</p>
       <div class="row">
         <input type="text" id="courseNoInput" placeholder="课程号，例如：2025" maxlength="30" style="width:190px">
         <input type="text" id="courseNameInput" placeholder="课程名称，例如：2025级专业班级选班" maxlength="40" style="width:300px">
+        <input type="password" id="adminPwdInput" placeholder="管理员密码" maxlength="64" style="width:170px" autocomplete="current-password">
         <button class="btn primary" id="enterBtn">进入课程</button>
       </div>
+      <div class="hint" id="pwdHint" style="margin-top:10px"></div>
       <div id="quickCourses" style="margin-top:14px"></div>
     </div>
   </div>
@@ -264,6 +266,19 @@
           <button class="btn danger" id="resetBtn">清空本课程选班记录</button>
           <button class="btn danger" id="resetCourseBtn">清空本课程班级与教师名单</button>
         </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h2>管理员密码</h2></div>
+      <div class="card-body">
+        <p class="muted">所有课程共用一个管理员密码。修改后其他已登录的管理端需重新登录；服务器上也可用 <code>python app.py --set-password 新密码</code> 直接重置。</p>
+        <div class="toolbar">
+          <input type="password" id="oldPwd" placeholder="原密码" maxlength="64" style="width:170px">
+          <input type="password" id="newPwd" placeholder="新密码（至少 8 位）" maxlength="64" style="width:220px">
+          <button class="btn primary" id="changePwdBtn">修改密码</button>
+        </div>
+        <div id="pwdResult" style="margin-top:10px"></div>
       </div>
     </div>
   </div>

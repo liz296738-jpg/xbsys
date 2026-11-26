@@ -4,6 +4,7 @@ const STORE_KEY = 'jxb_admin';
 const PAGE_SIZE = 40;
 const state = {
   course: null,
+  token: '',
   data: { classes: [], teachers: [], stats: {} },
   page: 1,
   capPicked: new Set(),
@@ -19,9 +20,28 @@ function toast(msg, kind) {
   setTimeout(() => el.remove(), 3200);
 }
 
+const NO_TOKEN = ['/api/admin/login', '/api/admin/courses', '/api/teacher/'];
+
+function withToken(url) {
+  if (!url.startsWith('/api/') || !state.token) return url;
+  if (NO_TOKEN.some(p => url.startsWith(p))) return url;
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'admin_token=' + encodeURIComponent(state.token);
+}
+
+function withTokenBody(body) {
+  if (!state.token) return body;
+  if (body instanceof FormData) { body.append('admin_token', state.token); return body; }
+  if (typeof body === 'string') {
+    try { const j = JSON.parse(body); j.admin_token = state.token; return JSON.stringify(j); } catch (e) { return body; }
+  }
+  return body;
+}
+
 async function api(url, opt) {
   const o = Object.assign({ cache: 'no-store' }, opt || {});
-  const res = await fetch(url, o);
+  o.headers = o.headers || {};
+  if (o.body) o.body = withTokenBody(o.body);
+  const res = await fetch(withToken(url), o);
   let data;
   try { data = await res.json(); } catch (e) { throw new Error('服务返回异常'); }
   if (!data.ok) throw new Error(data.error || '操作失败');
@@ -56,6 +76,12 @@ async function loadCourses() {
   try {
     const d = await api('/api/admin/courses');
     const box = $('#quickCourses');
+    const hint = $('#pwdHint');
+    if (hint) {
+      hint.textContent = d.password_set
+        ? '管理端已启用密码保护，请输入管理员密码。'
+        : '首次使用：管理员密码还没设置，本次输入的密码（至少 8 位）将作为管理员密码，请记牢。';
+    }
     if (!d.courses.length) {
       box.innerHTML = '<div class="muted">还没有课程。第一门课程在首次登录时自动创建。</div>';
       return;
@@ -70,9 +96,14 @@ async function loadCourses() {
 }
 
 async function doLogin(no, name) {
+  const pwd = $('#adminPwdInput').value;
+  if (!pwd) { toast('请输入管理员密码', 'err'); $('#adminPwdInput').focus(); return; }
   try {
-    const d = await postJSON('/api/admin/login', { course_no: no, course_name: name });
+    const d = await postJSON('/api/admin/login', { course_no: no, course_name: name, password: pwd });
+    state.token = d.admin_token || '';
     localStorage.setItem(STORE_KEY, JSON.stringify({ course_no: d.course.course_no, name: d.course.name }));
+    $('#adminPwdInput').value = '';
+    if (d.password_first_set) toast('已把本次输入的密码设为管理员密码，请记住', 'ok');
     if (d.created) toast('已创建课程「' + d.course.name + '」', 'ok');
     enterCourse(d.course);
   } catch (e) { toast(e.message, 'err'); }
@@ -354,12 +385,14 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 $('#enterBtn').onclick = () => doLogin($('#courseNoInput').value.trim(), $('#courseNameInput').value.trim());
-$('#courseNameInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#enterBtn').click(); });
+$('#courseNameInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#adminPwdInput').focus(); });
+$('#adminPwdInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#enterBtn').click(); });
 $('#courseNoInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#courseNameInput').focus(); });
 $('#switchCourseBtn').onclick = showLogin;
 $('#logoutBtn').onclick = () => {
   localStorage.removeItem(STORE_KEY);
   state.course = null;
+  state.token = '';
   showLogin();
 };
 
@@ -483,8 +516,8 @@ $('#tRemoveBtn').onclick = async () => {
 $('#importBtn').onclick = () => upload('/api/admin/import', $('#fileInput'), $('#importMode'), $('#importResult'));$('#importTeacherBtn').onclick = () => upload('/api/admin/import_teachers', $('#teacherFile'), $('#teacherMode'), $('#teacherImportResult'));
 $('#templateBtn').onclick = () => { window.location = '/api/admin/template'; };
 $('#teacherTemplateBtn').onclick = () => { window.location = '/api/admin/teacher_template'; };
-$('#teacherExportBtn').onclick = () => { window.location = '/api/admin/teacher_export?course_no=' + encodeURIComponent(courseNo()); };
-$('#exportBtn').onclick = () => { window.location = '/api/export?course_no=' + encodeURIComponent(courseNo()); };
+$('#teacherExportBtn').onclick = () => { window.location = withToken('/api/admin/teacher_export?course_no=' + encodeURIComponent(courseNo())); };
+$('#exportBtn').onclick = () => { window.location = withToken('/api/export?course_no=' + encodeURIComponent(courseNo())); };
 
 $('#resetBtn').onclick = async () => {
   if (!confirm('确定清空本课程的全部选班记录吗？班级与教师名单会保留。')) return;
@@ -503,12 +536,31 @@ $('#resetCourseBtn').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+$('#changePwdBtn').onclick = async () => {
+  const oldP = $('#oldPwd').value, newP = $('#newPwd').value;
+  const box = $('#pwdResult');
+  if (!oldP || !newP) { toast('请填写原密码和新密码', 'err'); return; }
+  try {
+    await postJSON('/api/admin/password', { course_no: courseNo(), old_password: oldP, new_password: newP });
+    box.innerHTML = '<div class="hint" style="background:#eefaf2;border-color:#bfe8d0;color:#0d7a41">管理员密码已更新</div>';
+    $('#oldPwd').value = '';
+    $('#newPwd').value = '';
+    toast('管理员密码已更新', 'ok');
+  } catch (e) {
+    box.innerHTML = '<div class="hint" style="background:#fff3f3;border-color:#f3c9c9;color:#a32020">' + esc(e.message) + '</div>';
+    toast(e.message, 'err');
+  }
+};
+
 /* ---------------- 启动 ---------------- */
 (function init() {
   showLogin();
   let saved = null;
   try { saved = JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { saved = null; }
   if (saved && saved.course_no && saved.name) {
-    doLogin(saved.course_no, saved.name);
+    $('#courseNoInput').value = saved.course_no;
+    $('#courseNameInput').value = saved.name;
+    $('#adminPwdInput').focus();
+    toast('请补输管理员密码后进入', 'ok');
   }
 })();
