@@ -12,10 +12,11 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
+port = int(os.environ.get("PORT", 8765))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, '选班系统.db')
 SEED_XLSX = os.path.join(BASE_DIR, '测试数据.xlsx')
-HOST, PORT = '127.0.0.1', 8765
+HOST, PORT = '0.0.0.0', port
 
 LOCK = threading.Lock()
 CONN = None
