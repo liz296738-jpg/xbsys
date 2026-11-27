@@ -97,8 +97,9 @@ function enterCourse(course) {
 function ruleText() {
   const max = state.rules.max_students == null ? 100 : state.rules.max_students;
   const min = state.rules.min_classes == null ? 2 : state.rules.min_classes;
-  return '本课程规则：每位教师最多 ' + max + ' 人；至少 ' + min +
-    ' 个班；班级不可拆分；已被其他教师选走的班级不会出现在列表中。';
+  return '本课程规则：每位教师最多 ' + (max > 0 ? max + ' 人' : '不限') + '；至少 ' +
+    (min > 0 ? min + ' 个班' : '0 个班（不选班也可提交，请在备注框写明原因）') +
+    '；班级不可拆分；已被其他教师选走的班级不会出现在列表中。';
 }
 
 /* ---------------- 登录 ---------------- */
@@ -167,6 +168,11 @@ async function refreshMine() {
   $('#myClasses').textContent = d.stats.classes;
   $('#myPeople').textContent = d.stats.students;
   $('#mineStats').textContent = '共 ' + d.stats.classes + ' 个班 / ' + d.stats.students + ' 人';
+  if (d.teacher_note) {
+    $('#noteInput').value = d.teacher_note;
+    $('#noteHint').textContent = '已向管理员提交情况说明：' + d.teacher_note;
+    $('#noteHint').style.display = 'block';
+  }
   renderMine();
 }
 
@@ -223,7 +229,8 @@ function updatePickBar() {
   state.classes.forEach(c => { if (state.picked.has(c.id)) people += c.plan_size; });
   $('#pickCount').textContent = state.picked.size;
   $('#pickPeople').textContent = people;
-  $('#submitBtn').disabled = state.picked.size === 0;
+  // 没勾班级但写了情况说明时也允许提交
+  $('#submitBtn').disabled = state.picked.size === 0 && !$('#noteInput').value.trim();
   const all = $('#checkAll');
   all.checked = state.classes.length > 0 && state.picked.size === state.classes.length;
 }
@@ -271,16 +278,23 @@ $('#submitBtn').addEventListener('click', async () => {
   $('#submitBtn').disabled = true;
   try {
     const d = await postJSON('/api/teacher/select', Object.assign(ident(), { ids, note }));
-    toast('已选 ' + d.added + ' 个班，当前共 ' + d.stats.classes + ' 个班 / ' + d.stats.students + ' 人', 'ok');
+    if (d.note_only) {
+      toast('已提交情况说明，管理员可在后台「教师选班情况」看到', 'ok');
+    } else {
+      toast('已选 ' + d.added + ' 个班，当前共 ' + d.stats.classes + ' 个班 / ' + d.stats.students + ' 人', 'ok');
+    }
     $('#noteInput').value = '';
+    $('#noteHint').style.display = 'none';
     await refreshAll();
   } catch (err) {
     toast(err.message, 'err');
     await refreshClasses();
   } finally {
-    $('#submitBtn').disabled = false;
+    updatePickBar();
   }
 });
+
+$('#noteInput').addEventListener('input', updatePickBar);
 
 let timer = null;
 $('#q').addEventListener('input', () => {

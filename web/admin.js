@@ -20,11 +20,14 @@ function toast(msg, kind) {
   setTimeout(() => el.remove(), 3200);
 }
 
-const NO_TOKEN = ['/api/admin/login', '/api/admin/courses', '/api/teacher/'];
+const NO_TOKEN_EXACT = ['/api/admin/login', '/api/admin/courses'];
+const NO_TOKEN_PREFIX = ['/api/teacher/'];
 
 function withToken(url) {
   if (!url.startsWith('/api/') || !state.token) return url;
-  if (NO_TOKEN.some(p => url.startsWith(p))) return url;
+  const path = url.split('?')[0];
+  if (NO_TOKEN_EXACT.indexOf(path) >= 0) return url;
+  if (NO_TOKEN_PREFIX.some(p => path.startsWith(p))) return url;
   return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'admin_token=' + encodeURIComponent(state.token);
 }
 
@@ -75,23 +78,12 @@ function showLogin() {
 async function loadCourses() {
   try {
     const d = await api('/api/admin/courses');
-    const box = $('#quickCourses');
     const hint = $('#pwdHint');
     if (hint) {
       hint.textContent = d.password_set
         ? '管理端已启用密码保护，请输入管理员密码。'
         : '首次使用：管理员密码还没设置，本次输入的密码（至少 8 位）将作为管理员密码，请记牢。';
     }
-    if (!d.courses.length) {
-      box.innerHTML = '<div class="muted">还没有课程。第一门课程在首次登录时自动创建。</div>';
-      return;
-    }
-    box.innerHTML = '<div class="muted" style="margin-bottom:8px">已创建的课程（点击直接进入）：</div>' +
-      d.courses.map(c => `<button class="btn sm" style="margin:0 8px 8px 0" data-no="${esc(c.course_no)}"
-        data-name="${esc(c.name)}">${esc(c.name)} · ${esc(c.course_no)}（${c.classes} 班 / ${c.teachers} 教师）</button>`).join('');
-    box.querySelectorAll('button').forEach(b => {
-      b.onclick = () => doLogin(b.dataset.no, b.dataset.name);
-    });
   } catch (e) { /* 忽略 */ }
 }
 
@@ -159,8 +151,9 @@ function renderStats() {
 }
 
 function statusTag(t) {
-  return t.n > 0 ? '<span class="tag green">已选班 ' + t.n + ' 个</span>'
-                 : '<span class="tag orange">未选班</span>';
+  if (t.n > 0) return '<span class="tag green">已选班 ' + t.n + ' 个</span>';
+  if (t.note) return '<span class="tag blue">未选班·已说明</span>';
+  return '<span class="tag orange">未选班</span>';
 }
 
 function teacherRows(list) {
@@ -170,6 +163,7 @@ function teacherRows(list) {
     <td class="num">${t.n}</td>
     <td class="num">${t.students}</td>
     <td>${statusTag(t)}</td>
+    <td>${esc(t.note || '')}</td>
   </tr>`).join('');
 }
 
@@ -355,7 +349,7 @@ async function loadLoginLog() {
   const body = $('#loginLogBody'), empty = $('#loginLogEmpty');
   if (!body) return;
   try {
-    const d = await api('/api/admin/login_log');
+    const d = await api('/api/admin/login_log?course_no=' + encodeURIComponent(courseNo()));
     const items = d.items || [];
     body.innerHTML = items.map(it => '<tr>'
       + '<td class="muted">' + esc((it.time || '').replace('T', ' ').slice(0, 19)) + '</td>'
@@ -453,8 +447,8 @@ $('#applySelBtn').onclick = async () => {
 };
 $('#saveRuleBtn').onclick = async () => {
   try {
-    await postJSON('/api/admin/settings', { key: 'teacher_max_students', value: $('#maxStudents').value });
-    await postJSON('/api/admin/settings', { key: 'teacher_min_classes', value: $('#minClasses').value });
+    await postJSON('/api/admin/settings', { course_no: courseNo(), key: 'teacher_max_students', value: $('#maxStudents').value });
+    await postJSON('/api/admin/settings', { course_no: courseNo(), key: 'teacher_min_classes', value: $('#minClasses').value });
     toast('教师规则已保存', 'ok');
   } catch (e) { toast(e.message, 'err'); }
 };

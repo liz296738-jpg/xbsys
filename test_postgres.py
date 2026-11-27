@@ -8,7 +8,6 @@ from postgres_backend import Connection
 
 def main():
     conn = Connection(app.DATABASE_URL)
-    original_commit = conn.commit
     conn.commit = lambda: None
     app.db = lambda: conn
     suffix = uuid.uuid4().hex[:12]
@@ -27,8 +26,37 @@ def main():
         for index in range(2):
             ids.append(conn.execute('INSERT INTO classes(course_id,college,name,plan_size,major,grade,campus) VALUES(?,?,?,?,?,?,?)',
                                     (cid, '测试学院', f'检查班级{index}', 10, '测试', '2026', '测试校区')).lastrowid)
+        # Test fixture settings stay inside this transaction and are rolled back.
+        conn.execute("UPDATE settings SET value='2' WHERE key='teacher_min_classes'")
+        conn.execute("UPDATE settings SET value='100' WHERE key='teacher_max_students'")
+        try:
+            app.select_classes(course_no, suffix, '部署检查教师', [])
+            raise AssertionError('Empty submission was accepted')
+        except app.BizError:
+            pass
+        explanation = '本学期不承担本课程（部署检查）'
+        note_result = app.select_classes(course_no, suffix, '部署检查教师', [], explanation)
+        assert note_result['note_only'] and note_result['added'] == 0
+        assert app.my_selections(course_no, suffix, '部署检查教师')['teacher_note'] == explanation
+        assert app.admin_overview(course_no)['teachers'][0]['note'] == explanation
+        workbook = openpyxl.load_workbook(io.BytesIO(app.export_result(course_no)))
+        assert workbook['教师汇总'].cell(2, 6).value == explanation
+        assert workbook['未选班教师'].cell(2, 4).value == explanation
+        teachers_export = openpyxl.load_workbook(io.BytesIO(app.export_teachers_list(course_no)))
+        assert teachers_export.active.cell(2, 6).value == explanation
+        admin_token = app.issue_admin_token(cid)
+        assert app.require_admin('', admin_token)['id'] == cid
+        assert app.require_admin(course_no, admin_token)['id'] == cid
+        other_id = conn.execute('INSERT INTO courses(course_no,name,created_at) VALUES(?,?,?)',
+                                ('OTHER-' + suffix, '其他课程', app.now_str())).lastrowid
+        try:
+            app.require_admin('OTHER-' + suffix, admin_token)
+            raise AssertionError('Cross-course administrator access was accepted')
+        except app.BizError:
+            pass
         result = app.select_classes(course_no, suffix, '部署检查教师', ids)
         assert result['added'] == 2
+        assert app.my_selections(course_no, suffix, '部署检查教师')['teacher_note'] == ''
         overview = app.admin_overview(course_no)
         assert len(overview['classes']) == 2
         assert overview['classes'][0]['teachers'] == '部署检查教师'
@@ -48,9 +76,13 @@ def main():
             raise AssertionError('Invalid administrator password was accepted')
         except app.BizError:
             assert conn.execute('SELECT 1 FROM courses WHERE course_no=?', ('DENIED-' + suffix,)).fetchone() is None
+        snapshot = app.startup_snapshot()
+        assert snapshot.startswith('PostgreSQL 启动快照 #')
+        saved = conn.execute('SELECT payload FROM startup_snapshots ORDER BY id DESC LIMIT 1').fetchone()['payload']
+        assert any(c['course_no'] == course_no for c in saved['courses'])
         conn.rollback()
         assert conn.execute('SELECT 1 FROM courses WHERE course_no=?', (course_no,)).fetchone() is None
-        print('PostgreSQL integration checks passed: selection, duplicate rejection, overview, export, login history, authorization and rollback.', flush=True)
+        print('PostgreSQL integration checks passed: note-only submissions and Excel exports, note clearing after selection, course authorization, startup snapshots, selection rules, login history and rollback.', flush=True)
     finally:
         conn.rollback()
         conn.close()

@@ -55,7 +55,7 @@ class Connection:
         sql = translate(sql)
         match = re.match(r'INSERT INTO (\w+)', sql, re.I)
         returning = bool(match and match[1] in {
-            'courses', 'classes', 'teachers', 'course_teachers', 'selections'
+            'courses', 'classes', 'teachers', 'course_teachers', 'selections', 'startup_snapshots'
         })
         if returning:
             sql += ' RETURNING id'

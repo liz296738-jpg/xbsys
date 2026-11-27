@@ -14,6 +14,8 @@ from urllib.parse import urlparse, parse_qs, quote
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get('JXB_DB') or os.path.join(BASE_DIR, '选班系统.db')
+DB_PREEXISTED = os.path.isfile(DB_PATH)     # 本次启动前数据库是否已存在（决定是否允许自动播种）
+BACKUP_DIR = os.environ.get('JXB_BACKUP') or os.path.join(BASE_DIR, '备份')
 SEED_XLSX = os.path.join(BASE_DIR, '测试数据.xlsx')
 # 部署成网站时：JXB_HOST=0.0.0.0 让所有网卡/内网都能访问；JXB_PORT 改端口
 HOST = os.environ.get('JXB_HOST', '127.0.0.1')
@@ -21,6 +23,7 @@ PORT = int(os.environ.get('PORT') or os.environ.get('JXB_PORT', '8765'))
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 if DATABASE_URL:
     HOST = '0.0.0.0'
+    DB_PREEXISTED = True
 
 LOCK = threading.Lock()
 _LOCAL = threading.local()
@@ -82,6 +85,13 @@ CREATE TABLE IF NOT EXISTS selections(
 CREATE TABLE IF NOT EXISTS settings(
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS teacher_notes(
+    course_id INTEGER NOT NULL,
+    teacher_id INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(course_id, teacher_id)
 );
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
@@ -157,24 +167,29 @@ def get_setting(key):
     return int(row['value']) if row else 0
 
 
-def seed_default_course():
-    """首次启动：建默认课程并从 测试数据.xlsx 导入班级"""
-    if db().execute('SELECT COUNT(*) c FROM courses').fetchone()['c'] > 0:
+def seed_default_course(force=False):
+    """建默认课程并从 测试数据.xlsx 导入班级。缺种子文件时什么都不做（不会建空课程）。
+    只允许在“真正首次安装”或显式 --seed-test 时执行，已有数据的库不会被覆盖或重复导入。
+    返回导入班级数；-1 表示没有种子文件。"""
+    if not force and db().execute('SELECT COUNT(*) c FROM courses').fetchone()['c'] > 0:
         return 0
+    if not os.path.exists(SEED_XLSX):
+        return -1
+    try:
+        import openpyxl
+    except ImportError:
+        return -1
+    wb = openpyxl.load_workbook(SEED_XLSX, data_only=True)
+    ws = wb['班级教学计划'] if '班级教学计划' in wb.sheetnames else wb.worksheets[0]
+    rows = [r for r in ws.iter_rows(min_row=2, values_only=True) if any(r)]
+    if not rows:
+        wb.close()
+        return -1
     with LOCK:
         cur = db().execute('INSERT INTO courses(course_no, name, created_at) VALUES(?,?,?)',
                            (DEFAULT_COURSE_NO, DEFAULT_COURSE_NAME, now_str()))
         cid = cur.lastrowid
         db().commit()
-    if not os.path.exists(SEED_XLSX):
-        return 0
-    try:
-        import openpyxl
-    except ImportError:
-        return 0
-    wb = openpyxl.load_workbook(SEED_XLSX, data_only=True)
-    ws = wb['班级教学计划']
-    rows = [r for r in ws.iter_rows(min_row=2, values_only=True) if any(r)]
     n = 0
     with LOCK:
         for r in rows:
@@ -191,7 +206,76 @@ def seed_default_course():
                           str(grade or ''), str(campus or '')))
             n += 1
         db().commit()
+    try:
+        wb.close()
+    except Exception:
+        pass
     return n
+
+
+# ---------------------------------------------------------------- 数据保护
+def startup_snapshot(keep=15):
+    """每次启动前把现有数据库热备一份到 备份/，防止重启或误操作把上一次的选班结果弄丢"""
+    if DATABASE_URL:
+        conn = db()
+        payload = {table: [dict(row) for row in conn.execute('SELECT * FROM ' + table).fetchall()]
+                   for table in ('courses', 'classes', 'teachers', 'course_teachers',
+                                 'selections', 'settings', 'teacher_notes')}
+        cur = conn.execute('INSERT INTO startup_snapshots(created_at,payload) VALUES(?,?)',
+                           (now_str(), json.dumps(payload, ensure_ascii=False)))
+        snapshot_id = cur.lastrowid
+        conn.execute('DELETE FROM startup_snapshots WHERE id NOT IN '
+                     '(SELECT id FROM startup_snapshots ORDER BY id DESC LIMIT ?)', (keep,))
+        conn.commit()
+        return 'PostgreSQL 启动快照 #%s' % snapshot_id
+    if not os.path.isfile(DB_PATH):
+        return None
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        dst = os.path.join(BACKUP_DIR, '启动快照-%s.db' % datetime.now().strftime('%Y%m%d-%H%M%S'))
+        src = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            src.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            out = sqlite3.connect(dst)
+            try:
+                src.backup(out)
+            finally:
+                out.close()
+        finally:
+            src.close()
+        files = sorted((f for f in os.listdir(BACKUP_DIR) if f.startswith('启动快照-') and f.endswith('.db')),
+                       reverse=True)
+        for f in files[keep:]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, f))
+            except OSError:
+                pass
+        return dst
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def data_summary():
+    counts = {}
+    for key, sql in (('课程', 'SELECT COUNT(*) c FROM courses'),
+                     ('班级', 'SELECT COUNT(*) c FROM classes'),
+                     ('教师', 'SELECT COUNT(*) c FROM teachers'),
+                     ('选班记录', 'SELECT COUNT(*) c FROM selections')):
+        try:
+            counts[key] = db().execute(sql).fetchone()['c']
+        except Exception:
+            counts[key] = -1
+    return counts
+
+
+def newest_snapshot():
+    """备份目录里最新一份启动快照（用于数据库意外为空时提示回滚）"""
+    if not os.path.isdir(BACKUP_DIR):
+        return None
+    files = sorted((f for f in os.listdir(BACKUP_DIR) if f.startswith('启动快照-') and f.endswith('.db')),
+                   reverse=True)
+    return os.path.join(BACKUP_DIR, files[0]) if files else None
 
 
 # ---------------------------------------------------------------- 业务
@@ -352,6 +436,31 @@ def log_login(employee_no, name, ok, detail, matched=''):
         traceback.print_exc()
 
 
+def _read_jsonl(path):
+    """容错读取 JSONL：历史日志可能混入 GBK 编码的行，逐行解码，坏行跳过而不是整份读不出"""
+    rows = []
+    with open(path, 'rb') as f:
+        raw = f.read()
+    for line in raw.split(b'\n'):
+        line = line.strip()
+        if not line:
+            continue
+        text = None
+        for enc in ('utf-8', 'gbk', 'gb18030'):
+            try:
+                text = line.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            continue
+        try:
+            rows.append(json.loads(text))
+        except Exception:
+            continue
+    return rows
+
+
 def recent_logins(limit=30):
     if DATABASE_URL:
         return [json.loads(r['payload']) for r in db().execute(
@@ -359,17 +468,9 @@ def recent_logins(limit=30):
     if not os.path.exists(LOGIN_LOG):
         return []
     try:
-        with open(LOGIN_LOG, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
         items = []
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                items.append(json.loads(line))
-            except Exception:
-                continue
+        for rec in reversed(_read_jsonl(LOGIN_LOG)):
+            items.append(rec)
             if len(items) >= limit:
                 break
         return items
@@ -487,20 +588,26 @@ def issue_admin_token(course_id):
 
 
 def require_admin(course_no, token):
-    """管理端鉴权：必须持有登录时发放的管理员凭证，且只对当门课程有效"""
-    no = (course_no or '').strip()
-    if not no:
-        raise BizError('缺少课程号')
+    """管理端鉴权：只认登录时发放的管理员凭证。
+    course_no 允许省略——省略时按凭证里记录的课程授权，避免前端漏传课程号就报错。"""
     tk = str(token or '').strip()
     if not tk:
         raise BizError('管理端登录已失效，请重新登录')
-    c = db().execute('SELECT * FROM courses WHERE course_no=?', (no,)).fetchone()
-    if not c:
-        raise BizError('课程不存在')
-    row = db().execute('SELECT 1 FROM admin_sessions WHERE token=? AND course_id=?',
-                       (tk, c['id'])).fetchone()
+    row = db().execute('SELECT * FROM admin_sessions WHERE token=?', (tk,)).fetchone()
     if not row:
-        raise BizError('管理端登录已失效或无权访问该课程，请重新登录')
+        raise BizError('管理端登录已失效，请重新登录')
+    cid = row['course_id']
+    no = _clean(course_no)
+    if no:
+        c = db().execute('SELECT * FROM courses WHERE course_no=?', (no,)).fetchone()
+        if not c:
+            raise BizError('课程不存在：%s' % no)
+        if c['id'] != cid:
+            raise BizError('当前管理凭证不属于课程 %s，请重新登录该课程' % no)
+        return c
+    c = db().execute('SELECT * FROM courses WHERE id=?', (cid,)).fetchone()
+    if not c:
+        raise BizError('登录的课程已被删除，请重新登录')
     return c
 
 
@@ -584,9 +691,10 @@ def admin_overview(course_no):
         'SELECT t.id, t.employee_no, t.name, t.imported, '
         '(SELECT COUNT(*) FROM selections s WHERE s.course_id=? AND s.teacher_id=t.id) AS n, '
         '(SELECT COALESCE(SUM(cl.plan_size),0) FROM selections s JOIN classes cl ON cl.id=s.class_id '
-        ' WHERE s.course_id=? AND s.teacher_id=t.id) AS students '
+        ' WHERE s.course_id=? AND s.teacher_id=t.id) AS students, '
+        "(SELECT tn.note FROM teacher_notes tn WHERE tn.course_id=? AND tn.teacher_id=t.id) AS note "
         'FROM teachers t JOIN course_teachers ct ON ct.teacher_id=t.id AND ct.course_id=? '
-        'ORDER BY n DESC, t.name', (cid, cid, cid)).fetchall()]
+        'ORDER BY n DESC, t.name', (cid, cid, cid, cid)).fetchall()]
     total = len(classes)
     taken = sum(1 for x in classes if x['taken'] > 0)
     below = sum(1 for x in classes if x['taken'] < x['min_need'])
@@ -645,7 +753,9 @@ def my_selections(course_no, employee_no, name, token=''):
         'SELECT c.id, c.college, c.name, c.plan_size, c.major, c.grade, c.campus, c.cap, c.min_need, '
         's.note, s.created_at FROM selections s JOIN classes c ON c.id=s.class_id '
         'WHERE s.course_id=? AND s.teacher_id=? ORDER BY c.campus, c.name', (c['id'], t['id'])).fetchall()]
-    return {'classes': items,
+    row = db().execute('SELECT note, updated_at FROM teacher_notes WHERE course_id=? AND teacher_id=?',
+                       (c['id'], t['id'])).fetchone()
+    return {'classes': items, 'teacher_note': (row['note'] if row else ''), 'teacher_note_at': (row['updated_at'] if row else ''),
             'stats': {'classes': len(items), 'students': sum(i['plan_size'] for i in items)}}
 
 
@@ -654,10 +764,20 @@ def select_classes(course_no, employee_no, name, ids, note='', token=''):
     t = resolve_teacher({'token': token, 'employee_no': employee_no, 'name': name})
     if not in_roster(c['id'], t['id']):
         raise BizError('您不在本课程的选班教师名单中，请联系课程管理员')
-    if not ids:
-        raise BizError('请至少选择 1 个班级')
+    note = (note or '').strip()
     max_students = get_setting('teacher_max_students')
     min_classes = get_setting('teacher_min_classes')
+    # 一个班都不选，但写了说明：允许提交，作为“情况说明”留档，不计入最少班数限制
+    if not ids:
+        if not note:
+            raise BizError('请勾选班级；如果本学期不承担本课程，请在备注框写明原因后再提交')
+        with LOCK:
+            db().execute('INSERT INTO teacher_notes(course_id, teacher_id, note, updated_at) VALUES(?,?,?,?) '
+                         'ON CONFLICT(course_id, teacher_id) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at',
+                         (c['id'], t['id'], note, now_str()))
+            db().commit()
+        st = my_selections(course_no, employee_no, name, token)
+        return {'added': 0, 'note_only': True, 'stats': st['stats']}
     with LOCK:
         if DATABASE_URL:
             db().execute('SELECT pg_advisory_xact_lock(20261126)')
@@ -689,6 +809,8 @@ def select_classes(course_no, employee_no, name, ids, note='', token=''):
         for r in adding:
             db().execute('INSERT INTO selections(course_id, class_id, teacher_id, note, created_at) '
                          'VALUES(?,?,?,?,?)', (c['id'], r['id'], t['id'], note or '', now_str()))
+        # 已实际选班，之前“不承担本课程”的说明自动失效
+        db().execute('DELETE FROM teacher_notes WHERE course_id=? AND teacher_id=?', (c['id'], t['id']))
         db().commit()
     return {'added': len(adding), 'stats': {'classes': new_count, 'students': new_total}}
 
@@ -1041,9 +1163,10 @@ def export_result(course_no):
         'SELECT t.name, t.employee_no, '
         '(SELECT COUNT(*) FROM selections s WHERE s.course_id=? AND s.teacher_id=t.id) n, '
         '(SELECT COALESCE(SUM(cl.plan_size),0) FROM selections s JOIN classes cl ON cl.id=s.class_id '
-        ' WHERE s.course_id=? AND s.teacher_id=t.id) students '
+        ' WHERE s.course_id=? AND s.teacher_id=t.id) students, '
+        '(SELECT tn.note FROM teacher_notes tn WHERE tn.course_id=? AND tn.teacher_id=t.id) note '
         'FROM teachers t JOIN course_teachers ct ON ct.teacher_id=t.id AND ct.course_id=? '
-        'ORDER BY n DESC, t.name', (cid, cid, cid)).fetchall()
+        'ORDER BY n DESC, t.name', (cid, cid, cid, cid)).fetchall()
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1057,21 +1180,21 @@ def export_result(course_no):
     for r in left:
         ws2.append([r['campus'], r['college'], r['cls'], r['major'], r['grade'], r['plan_size']])
     ws3 = wb.create_sheet('教师汇总')
-    ws3.append(['教师', '工号', '已选班级数', '合计人数', '状态'])
+    ws3.append(['教师', '工号', '已选班级数', '合计人数', '状态', '情况说明'])
     for r in teachers:
         ws3.append([r['name'], r['employee_no'], r['n'], r['students'],
-                    '已选班' if r['n'] > 0 else '未选班'])
+                    '已选班' if r['n'] > 0 else '未选班', r['note'] or ''])
     ws4 = wb.create_sheet('未选班教师')
-    ws4.append(['教师', '工号', '状态'])
+    ws4.append(['教师', '工号', '状态', '情况说明'])
     unsel = [r for r in teachers if r['n'] == 0]
     for r in unsel:
-        ws4.append([r['name'], r['employee_no'], '未选班'])
+        ws4.append([r['name'], r['employee_no'], '未选班', r['note'] or ''])
     if not unsel:
-        ws4.append(['（无未选班教师）', '', ''])
+        ws4.append(['（无未选班教师）', '', '', ''])
     _style_sheet(ws, [12, 14, 10, 22, 14, 12, 8, 10, 30, 18])
     _style_sheet(ws2, [10, 22, 14, 12, 8, 10])
-    _style_sheet(ws3, [12, 14, 14, 12, 10])
-    _style_sheet(ws4, [12, 14, 10])
+    _style_sheet(ws3, [12, 14, 14, 12, 10, 36])
+    _style_sheet(ws4, [12, 14, 10, 36])
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
@@ -1083,18 +1206,19 @@ def export_teachers_list(course_no):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = '选班教师名单'
-    ws.append(['工号', '姓名', '已选班级数', '合计人数', '状态'])
+    ws.append(['工号', '姓名', '已选班级数', '合计人数', '状态', '情况说明'])
     rows = db().execute(
         'SELECT t.employee_no, t.name, '
         '(SELECT COUNT(*) FROM selections s WHERE s.course_id=? AND s.teacher_id=t.id) n, '
         '(SELECT COALESCE(SUM(cl.plan_size),0) FROM selections s JOIN classes cl ON cl.id=s.class_id '
-        ' WHERE s.course_id=? AND s.teacher_id=t.id) students '
+        ' WHERE s.course_id=? AND s.teacher_id=t.id) students, '
+        '(SELECT tn.note FROM teacher_notes tn WHERE tn.course_id=? AND tn.teacher_id=t.id) note '
         'FROM teachers t JOIN course_teachers ct ON ct.teacher_id=t.id AND ct.course_id=? '
-        'ORDER BY n DESC, t.name', (c['id'], c['id'], c['id'])).fetchall()
+        'ORDER BY n DESC, t.name', (c['id'], c['id'], c['id'], c['id'])).fetchall()
     for r in rows:
         ws.append([r['employee_no'], r['name'], r['n'], r['students'],
-                   '已选班' if r['n'] > 0 else '未选班'])
-    _style_sheet(ws, [14, 12, 14, 12, 10])
+                   '已选班' if r['n'] > 0 else '未选班', r['note'] or ''])
+    _style_sheet(ws, [14, 12, 14, 12, 10, 36])
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
@@ -1193,6 +1317,7 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
                 _LOCAL.conn = None
 
+
     def log_message(self, fmt, *args):
         pass
 
@@ -1252,6 +1377,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err('页面不存在', 404)
             return self._api_get(path, qs)
         except BizError as e:
+            if e.msg not in ('未知接口',):
+                print('[api-get] %s -> %s' % (path, e.msg), flush=True)
             return self._err(e.msg)
         except Exception:
             traceback.print_exc()
@@ -1275,6 +1402,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(body.decode('utf-8')) if body else {}
             return self._api_post(path, payload, files)
         except BizError as e:
+            print('[api-post] %s -> %s' % (path, e.msg), flush=True)
             return self._err(e.msg)
         except Exception:
             traceback.print_exc()
@@ -1289,20 +1417,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'ok': True, 'courses': list_courses(), 'settings': current_settings(),
                                'password_set': admin_password_set()})
         if path == '/api/admin/overview':
-            require_admin(self.g(qs, 'course_no'), self.g(qs, 'admin_token'))
-            return self._json({'ok': True, **admin_overview(self.g(qs, 'course_no'))})
+            c = require_admin(self.g(qs, 'course_no'), self.g(qs, 'admin_token'))
+            return self._json({'ok': True, **admin_overview(c['course_no'])})
         if path == '/api/export':
-            no = self.g(qs, 'course_no')
-            require_admin(no, self.g(qs, 'admin_token'))
-            return self._xlsx(export_result(no), '选班结果-%s.xlsx' % no)
+            c = require_admin(self.g(qs, 'course_no'), self.g(qs, 'admin_token'))
+            return self._xlsx(export_result(c['course_no']), '选班结果-%s.xlsx' % c['course_no'])
         if path == '/api/admin/template':
             return self._xlsx(export_classes_template(), '专业班级导入模板.xlsx')
         if path == '/api/admin/teacher_template':
             return self._xlsx(export_teachers_template(), '选班教师名单模板.xlsx')
         if path == '/api/admin/teacher_export':
-            no = self.g(qs, 'course_no')
-            require_admin(no, self.g(qs, 'admin_token'))
-            return self._xlsx(export_teachers_list(no), '选班教师名单-%s.xlsx' % no)
+            c = require_admin(self.g(qs, 'course_no'), self.g(qs, 'admin_token'))
+            return self._xlsx(export_teachers_list(c['course_no']), '选班教师名单-%s.xlsx' % c['course_no'])
         if path == '/api/teacher/classes':
             return self._json({'ok': True, **available_classes(
                 self.g(qs, 'course_no'), self.g(qs, 'no'), self.g(qs, 'name'),
@@ -1350,10 +1476,10 @@ class Handler(BaseHTTPRequestHandler):
                 payload.get('course_no'), payload.get('employee_no'), payload.get('name'),
                 int(payload.get('class_id')), payload.get('note', ''), payload.get('token'))})
         if path == '/api/admin/caps':
-            require_admin(payload.get('course_no'), payload.get('admin_token'))
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
             ids = [int(i) for i in payload.get('ids', []) if str(i).isdigit()]
             return self._json({'ok': True, **set_caps(
-                payload.get('course_no'), ids, payload.get('cap'), payload.get('min_need', 0),
+                c['course_no'], ids, payload.get('cap'), payload.get('min_need', 0),
                 items=payload.get('items')) })
         if path == '/api/admin/settings':
             require_admin(payload.get('course_no'), payload.get('admin_token'))
@@ -1364,35 +1490,35 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
             return self._json({'ok': True})
         if path == '/api/admin/import':
-            require_admin(payload.get('course_no'), payload.get('admin_token'))
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
             f = files.get('file')
             if not f:
                 raise BizError('请选择要导入的文件')
             rows = parse_classes_table(f[0], f[1])
             return self._json({'ok': True, **import_classes(
-                payload.get('course_no'), rows, payload.get('mode', 'skip'))})
+                c['course_no'], rows, payload.get('mode', 'skip'))})
         if path == '/api/admin/import_teachers':
-            require_admin(payload.get('course_no'), payload.get('admin_token'))
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
             f = files.get('file')
             if not f:
                 raise BizError('请选择要导入的文件')
             rows = parse_teachers_table(f[0], f[1])
             return self._json({'ok': True, **import_teachers(
-                payload.get('course_no'), rows, payload.get('mode', 'skip'))})
+                c['course_no'], rows, payload.get('mode', 'skip'))})
         if path == '/api/admin/add_teacher':
-            require_admin(payload.get('course_no'), payload.get('admin_token'))
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **add_teacher(
-                payload.get('course_no'), payload.get('employee_no'), payload.get('name'))})
+                c['course_no'], payload.get('employee_no'), payload.get('name'))})
         if path == '/api/admin/remove_teacher':
-            require_admin(payload.get('course_no'), payload.get('admin_token'))
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **remove_teacher(
-                payload.get('course_no'), payload.get('teacher_id'))})
+                c['course_no'], payload.get('teacher_id'))})
         if path == '/api/admin/reset':
-            require_admin(payload.get('course_no'), payload.get('admin_token'))
-            return self._json({'ok': True, **reset_course_selections(payload.get('course_no'))})
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
+            return self._json({'ok': True, **reset_course_selections(c['course_no'])})
         if path == '/api/admin/reset_course':
-            require_admin(payload.get('course_no'), payload.get('admin_token'))
-            return self._json({'ok': True, **reset_course(payload.get('course_no'))})
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
+            return self._json({'ok': True, **reset_course(c['course_no'])})
         if path == '/api/admin/reset_all':
             require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **reset_all()})
@@ -1442,9 +1568,42 @@ def main():
                 HOST = val
             elif name == 'PORT' and val.isdigit():
                 PORT = int(val)
-    n = seed_default_course()
-    if n:
-        print('[init] 已创建默认课程 %s 并导入 %d 个班级' % (DEFAULT_COURSE_NO, n))
+    snap = startup_snapshot()
+    # 只有在“本次启动前数据库还不存在”（真正首次安装）或显式 --seed-test 时，才导入测试数据
+    if '--seed-test' in sys.argv:
+        n = seed_default_course(force=True)
+        if n < 0:
+            print('[init] 找不到种子文件 测试数据.xlsx，未创建默认课程（请用管理端导入班级）')
+        else:
+            print('[init] 已按 --seed-test 重建默认课程并导入 %d 个测试班级' % n)
+    elif not DB_PREEXISTED:
+        n = seed_default_course()
+        if n < 0:
+            print('[init] 首次启动：没有 测试数据.xlsx，跳过默认课程导入（建课程请用管理端登录）')
+        elif n:
+            print('[init] 首次安装：已创建默认课程 %s 并导入 %d 个班级' % (DEFAULT_COURSE_NO, n))
+    else:
+        n = 0      # 数据库已存在：绝不动数据，直接读里面最后一次的状态
+
+    print('')
+    print('数据库：%s' % ('Supabase PostgreSQL' if DATABASE_URL else DB_PATH))
+    print('启动快照：%s' % (snap or '（首次运行，暂无快照）'))
+    s = data_summary()
+    print('现有数据：课程 %d · 班级 %d · 教师 %d · 选班记录 %d' % (
+        s['课程'], s['班级'], s['教师'], s['选班记录']))
+    if s['课程'] == 0:
+        old = newest_snapshot()
+        print('！警告：数据库里没有任何课程。如果不是首次安装，说明程序读到的不是原来那个数据库文件。')
+        if old:
+            print('  最近的启动快照可以回滚：%s' % old)
+        print('  确认要重新导入测试数据，请用：python app.py --seed-test')
+    if not DATABASE_URL and (os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')):
+        print('！注意：当前运行在容器里。若启动命令没有把数据库挂载到宿主机，容器重建后数据会丢。')
+        print('  正确做法：docker run -v /宿主机/data:/app/data -e JXB_DB=/app/data/选班系统.db ...')
+    if os.environ.get('JXB_DB'):
+        print('数据库路径来自环境变量 JXB_DB（请确认指向持久化目录）')
+    print('')
+
     srv = Server((HOST, PORT), Handler)
     local = 'http://127.0.0.1:%d' % PORT
     print('教师选班系统已启动： %s   （管理端 %s/admin）' % (local, local))
