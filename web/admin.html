@@ -67,10 +67,13 @@
       <div class="card-head">
         <h2>教师选班汇总</h2>
         <div class="toolbar">
+          <input type="search" id="teacherSearch" placeholder="搜索姓名 / 工号 / 选班状态" aria-label="搜索教师姓名、工号或选班状态" style="width:230px">
           <select id="teacherFilter">
             <option value="all">全部教师</option>
             <option value="unselected">仅未选班</option>
             <option value="selected">仅已选班</option>
+            <option value="explained">未选班·已说明</option>
+            <option value="unexplained">未选班·未说明</option>
           </select>
           <button class="btn sm" id="refreshBtn">刷新</button>
         </div>
@@ -122,6 +125,8 @@
               <option value="all">全部</option>
               <option value="unselected">仅未选班</option>
               <option value="selected">仅已选班</option>
+            <option value="explained">未选班·已说明</option>
+            <option value="unexplained">未选班·未说明</option>
             </select>
           </div>
         </div>

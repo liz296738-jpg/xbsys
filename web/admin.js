@@ -64,6 +64,7 @@ const courseNo = () => (state.course ? state.course.course_no : '');
 
 /* ---------------- 登录 / 课程 ---------------- */
 function showLogin() {
+  clearImportResults();
   $('#loginBox').style.display = 'block';
   $('#mainBox').style.display = 'none';
   $('#switchCourseBtn').style.display = 'none';
@@ -102,6 +103,9 @@ async function doLogin(no, name) {
 }
 
 function enterCourse(course) {
+  clearImportResults();
+  $('#teacherSearch').value = '';
+  $('#teacherFilter').value = 'all';
   state.course = course;
   state.page = 1;
   state.curTeacherId = null;
@@ -167,13 +171,24 @@ function teacherRows(list) {
   </tr>`).join('');
 }
 
+function matchesTeacher(t, query, filter) {
+  if (filter === 'unselected' && t.n > 0) return false;
+  if (filter === 'selected' && t.n === 0) return false;
+  if (filter === 'explained' && (t.n > 0 || !t.note)) return false;
+  if (filter === 'unexplained' && (t.n > 0 || t.note)) return false;
+  const status = t.n > 0 ? '已选班' : ('未选班 ' + (t.note ? '已说明' : '未说明'));
+  const text = [t.name, t.employee_no || '', status].join(' ').toLowerCase();
+  return query.trim().toLowerCase().split(/\s+/).filter(Boolean).every(term => text.includes(term));
+}
+
 function renderTeacherSummary() {
   const filter = $('#teacherFilter').value;
+  const query = $('#teacherSearch').value;
   const all = state.data.teachers;
-  const list = all.filter(t => filter === 'all' ? true : (filter === 'unselected' ? t.n === 0 : t.n > 0));
+  const list = all.filter(t => matchesTeacher(t, query, filter));
   $('#teacherBody').innerHTML = teacherRows(list);
-  $('#teacherEmpty').style.display = all.length ? 'none' : 'block';
-  $('#teacherEmpty').textContent = '本课程还没有名单教师，请先在「名单与班级导入」页导入选班教师名单';
+  $('#teacherEmpty').style.display = list.length ? 'none' : 'block';
+  $('#teacherEmpty').textContent = all.length ? '没有符合搜索或状态筛选条件的教师' : '本课程还没有名单教师，请先导入选班教师名单';
 }
 
 /* ---------------- 班级明细 ---------------- */
@@ -224,12 +239,7 @@ function renderClasses() {
 function renderTeacherList() {
   const q = $('#tSearch').value.trim().toLowerCase();
   const filter = $('#tFilter').value;
-  const list = state.data.teachers.filter(t => {
-    if (filter === 'unselected' && t.n > 0) return false;
-    if (filter === 'selected' && t.n === 0) return false;
-    if (q && !((t.name + ' ' + (t.employee_no || '')).toLowerCase().indexOf(q) >= 0)) return false;
-    return true;
-  });
+  const list = state.data.teachers.filter(t => matchesTeacher(t, q, filter));
   $('#tListBody').innerHTML = list.map(t => `<tr class="pickable ${state.curTeacherId === t.id ? 'active-row' : ''}" data-id="${t.id}">
     <td>${esc(t.employee_no || '-')}</td>
     <td>${esc(t.name)}</td>
@@ -322,25 +332,43 @@ async function saveCaps(items) {
 }
 
 /* ---------------- 导入 ---------------- */
+function clearImportResults() {
+  state.importEpoch = (state.importEpoch || 0) + 1;
+  ['importResult', 'teacherImportResult'].forEach(id => { $('#' + id).textContent = ''; });
+  ['fileInput', 'teacherFile'].forEach(id => { $('#' + id).value = ''; });
+}
+
 async function upload(url, fileInput, modeInput, resultBox) {
   const f = fileInput.files[0];
   if (!f) { toast('请先选择文件', 'err'); return; }
+  const epoch = state.importEpoch || 0;
+  const targetCourse = courseNo();
+  const button = $(url === '/api/admin/import' ? '#importBtn' : '#importTeacherBtn');
+  if (button.disabled) return;
+  button.disabled = true;
+  fileInput.disabled = true;
+  resultBox.textContent = '正在导入本次文件：' + f.name + '…';
   const fd = new FormData();
   fd.append('file', f);
-  fd.append('course_no', courseNo());
+  fd.append('course_no', targetCourse);
   fd.append('mode', modeInput.value);
   try {
     const d = await api(url, { method: 'POST', body: fd });
+    if (epoch !== (state.importEpoch || 0) || targetCourse !== courseNo()) return;
     resultBox.innerHTML = '<div class="hint" style="background:#eefaf2;border-color:#bfe8d0;color:#0d7a41">'
-      + esc(d.message || '已导入') + '</div>';
-    toast('导入完成', 'ok');
-    await refresh();
+      + '<div>' + esc(d.message || '本次导入完成') + '</div>'
+      + '<div class="muted">文件：' + esc(f.name) + ' · 本次完成时间：' + esc(new Date().toLocaleString('zh-CN')) + '</div></div>';
+    toast('本次导入完成', 'ok');
+    await refresh().catch(e => toast('导入已完成，刷新失败：' + e.message, 'err'));
   } catch (e) {
+    if (epoch !== (state.importEpoch || 0) || targetCourse !== courseNo()) return;
     resultBox.innerHTML = '<div class="hint" style="background:#fff3f3;border-color:#f3c9c9;color:#a32020">'
       + esc(e.message) + '</div>';
     toast(e.message, 'err');
   } finally {
-    fileInput.value = '';
+    button.disabled = false;
+    fileInput.disabled = false;
+    if (epoch === (state.importEpoch || 0)) fileInput.value = '';
   }
 }
 
@@ -393,6 +421,7 @@ $('#logoutBtn').onclick = () => {
 $('#refreshBtn').onclick = () => refresh().catch(e => toast(e.message, 'err'));
 $('#loginLogBtn').onclick = () => loadLoginLog();
 $('#teacherFilter').onchange = renderTeacherSummary;
+$('#teacherSearch').addEventListener('input', renderTeacherSummary);
 $('#filter').onchange = () => { state.page = 1; renderClasses(); };
 let aqTimer = null;
 $('#aq').addEventListener('input', () => {
@@ -507,6 +536,8 @@ $('#tRemoveBtn').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+$('#fileInput').addEventListener('change', () => { $('#importResult').textContent = ''; });
+$('#teacherFile').addEventListener('change', () => { $('#teacherImportResult').textContent = ''; });
 $('#importBtn').onclick = () => upload('/api/admin/import', $('#fileInput'), $('#importMode'), $('#importResult'));$('#importTeacherBtn').onclick = () => upload('/api/admin/import_teachers', $('#teacherFile'), $('#teacherMode'), $('#teacherImportResult'));
 $('#templateBtn').onclick = () => { window.location = '/api/admin/template'; };
 $('#teacherTemplateBtn').onclick = () => { window.location = '/api/admin/teacher_template'; };
@@ -517,6 +548,7 @@ $('#resetBtn').onclick = async () => {
   if (!confirm('确定清空本课程的全部选班记录吗？班级与教师名单会保留。')) return;
   try {
     await postJSON('/api/admin/reset', { course_no: courseNo() });
+    clearImportResults();
     toast('已清空本课程选班记录', 'ok');
     await refresh();
   } catch (e) { toast(e.message, 'err'); }
@@ -525,6 +557,7 @@ $('#resetClassesBtn').onclick = async () => {
   if (!confirm('确定清空本课程的全部班级吗？相关选班记录也会删除，教师名单和情况说明保留。')) return;
   try {
     await postJSON('/api/admin/reset_classes', { course_no: courseNo() });
+    clearImportResults();
     toast('已清空本课程班级，教师名单已保留', 'ok');
     await refresh();
   } catch (e) { toast(e.message, 'err'); }
@@ -533,6 +566,7 @@ $('#resetTeachersBtn').onclick = async () => {
   if (!confirm('确定清空本课程的教师名单吗？相关选班记录和情况说明也会删除，班级保留。其他课程的教师名单不受影响。')) return;
   try {
     await postJSON('/api/admin/reset_teachers', { course_no: courseNo() });
+    clearImportResults();
     toast('已清空本课程教师名单，班级已保留', 'ok');
     await refresh();
   } catch (e) { toast(e.message, 'err'); }

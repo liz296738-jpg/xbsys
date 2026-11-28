@@ -101,6 +101,29 @@ def main():
         assert conn.execute('SELECT 1 FROM selections WHERE course_id=?', (cid,)).fetchone() is None
         assert conn.execute('SELECT 1 FROM teachers WHERE id=?', (tid,)).fetchone()
         assert conn.execute('SELECT 1 FROM course_teachers WHERE course_id=? AND teacher_id=?', (other_id, tid)).fetchone()
+        order_course = 'ORDER-' + suffix
+        conn.execute('INSERT INTO courses(course_no,name,created_at) VALUES(?,?,?)',
+                     (order_course, '导入顺序检查', app.now_str()))
+        roster = [('丙教师', 'Z' + suffix), ('甲教师', 'A' + suffix), ('乙教师', 'M' + suffix)]
+        first = app.import_teachers(order_course, roster)
+        assert (first['total'], first['added'], first['linked'], first['updated'], first['skipped']) == (3, 3, 3, 0, 0)
+        repeated = app.import_teachers(order_course, list(reversed(roster)))
+        assert (repeated['added'], repeated['linked'], repeated['updated'], repeated['skipped']) == (0, 0, 0, 3)
+        expected_names = [r[0] for r in reversed(roster)]
+        assert [r['name'] for r in app.admin_overview(order_course)['teachers']] == expected_names
+        for data, sheet, name_col in [(app.export_teachers_list(order_course), '选班教师名单', 2),
+                                      (app.export_result(order_course), '教师汇总', 1),
+                                      (app.export_result(order_course), '未选班教师', 1)]:
+            ws = openpyxl.load_workbook(io.BytesIO(data))[sheet]
+            assert [ws.cell(i, name_col).value for i in range(2, 5)] == expected_names
+        app.add_teacher(order_course, 'END' + suffix, '末尾教师')
+        assert app.admin_overview(order_course)['teachers'][-1]['name'] == '末尾教师'
+        class_rows = [('学院', '导入班一', 10, '专业', '2026', '校区'),
+                      ('学院', '导入班二', 20, '专业', '2026', '校区')]
+        first_classes = app.import_classes(order_course, class_rows)
+        repeat_classes = app.import_classes(order_course, class_rows)
+        assert (first_classes['total'], first_classes['added']) == (2, 2)
+        assert (repeat_classes['added'], repeat_classes['updated'], repeat_classes['skipped']) == (0, 0, 2)
         conn.rollback()
         assert conn.execute('SELECT 1 FROM courses WHERE course_no=?', (course_no,)).fetchone() is None
         print('PostgreSQL integration checks passed: note-only submissions and Excel exports, note clearing after selection, course authorization, startup snapshots, selection rules, login history and rollback.', flush=True)

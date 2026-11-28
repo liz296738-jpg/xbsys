@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS course_teachers(
     course_id INTEGER NOT NULL,
     teacher_id INTEGER NOT NULL,
     imported_at TEXT NOT NULL,
+    import_order INTEGER NOT NULL DEFAULT 0,
     UNIQUE(course_id, teacher_id),
     FOREIGN KEY(course_id) REFERENCES courses(id),
     FOREIGN KEY(teacher_id) REFERENCES teachers(id)
@@ -149,6 +150,9 @@ def init_schema(conn):
                 conn.execute('SELECT 1 FROM settings LIMIT 1')
             else:
                 conn.executescript(SCHEMA)
+                if 'import_order' not in [r['name'] for r in conn.execute('PRAGMA table_info(course_teachers)').fetchall()]:
+                    conn.execute('ALTER TABLE course_teachers ADD COLUMN import_order INTEGER NOT NULL DEFAULT 0')
+                    conn.execute('UPDATE course_teachers SET import_order=id')
             for k, v in DEFAULT_SETTINGS.items():
                 conn.execute('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)', (k, v))
             conn.commit()
@@ -694,7 +698,7 @@ def admin_overview(course_no):
         ' WHERE s.course_id=? AND s.teacher_id=t.id) AS students, '
         "(SELECT tn.note FROM teacher_notes tn WHERE tn.course_id=? AND tn.teacher_id=t.id) AS note "
         'FROM teachers t JOIN course_teachers ct ON ct.teacher_id=t.id AND ct.course_id=? '
-        'ORDER BY n DESC, t.name', (cid, cid, cid, cid)).fetchall()]
+        'ORDER BY ct.import_order, ct.id', (cid, cid, cid, cid)).fetchall()]
     total = len(classes)
     taken = sum(1 for x in classes if x['taken'] > 0)
     below = sum(1 for x in classes if x['taken'] < x['min_need'])
@@ -976,6 +980,7 @@ def import_classes(course_no, rows, mode='skip'):
             college, name, size, major, grade, campus = r
             name = (name or '').strip()
             if not name:
+                errors.append('第 %d 行班级名称为空' % idx)
                 continue
             try:
                 size = int(float(size))
@@ -1006,69 +1011,71 @@ def import_classes(course_no, rows, mode='skip'):
                           str(grade or ''), str(campus or '')))
             added += 1
         db().commit()
-    msg = '导入完成：新增 %d 个班，更新 %d 个班' % (added, updated)
+    msg = '本次导入：读取 %d 行，新增 %d 个班，更新 %d 个班，跳过 %d 行，异常 %d 行' % (len(rows), added, updated, len(dups), len(errors))
     if dups:
         msg += '，重复跳过 %d 个（%s%s）' % (len(dups), '、'.join(dups[:3]), '…' if len(dups) > 3 else '')
     if errors:
         msg += '；%d 行有问题（%s）' % (len(errors), '；'.join(errors[:3]))
-    return {'added': added, 'updated': updated, 'duplicates': dups, 'errors': errors, 'message': msg}
+    return {'total': len(rows), 'added': added, 'updated': updated, 'skipped': len(dups), 'duplicates': dups, 'errors': errors, 'message': msg}
 
 
 def import_teachers(course_no, rows, mode='skip'):
     c = require_course(course_no)
     added, linked, updated, dups, errors = 0, 0, 0, [], []
     seen = set()
+    ordered_ids = []
     with LOCK:
         for idx, r in enumerate(rows, 2):
             name = norm_name(r[0])
             no = norm_no(r[1]) if len(r) > 1 else ''
-            if not name:
-                errors.append('第 %d 行姓名为空' % idx)
+            if not name or not no:
+                errors.append('第 %d 行姓名或工号为空，登录需要工号+姓名同时匹配' % idx)
                 continue
-            if not no:
-                errors.append('第 %d 行（%s）缺少工号，登录需要工号+姓名同时匹配' % (idx, name))
-                continue
-            key = (no, name)
-            if key in seen:
+            if no in seen:
                 dups.append(name)
                 continue
-            seen.add(key)
-            if no:
-                row = db().execute('SELECT * FROM teachers WHERE employee_no=?', (no,)).fetchone()
-            else:
-                row = db().execute("SELECT * FROM teachers WHERE employee_no='' AND name=?", (name,)).fetchone()
+            seen.add(no)
+            row = db().execute('SELECT * FROM teachers WHERE employee_no=?', (no,)).fetchone()
+            changed = False
             if row:
                 tid = row['id']
                 if row['name'] != name:
-                    # 同一工号换了姓名，按名单为准
                     db().execute('UPDATE teachers SET name=? WHERE id=?', (name, tid))
-                    updated += 1
-                elif mode == 'overwrite' and not row['imported']:
+                    changed = True
+                if mode == 'overwrite' and not row['imported']:
                     db().execute('UPDATE teachers SET imported=1 WHERE id=?', (tid,))
-                    updated += 1
+                    changed = True
             else:
                 cur = db().execute('INSERT INTO teachers(employee_no, name, created_at, imported) '
                                    'VALUES(?,?,?,1)', (no, name, now_str()))
                 tid = cur.lastrowid
                 added += 1
+            ordered_ids.append(tid)
             existed = db().execute('SELECT 1 FROM course_teachers WHERE course_id=? AND teacher_id=?',
                                    (c['id'], tid)).fetchone()
-            db().execute('INSERT OR IGNORE INTO course_teachers(course_id, teacher_id, imported_at) '
-                         'VALUES(?,?,?)', (c['id'], tid, now_str()))
             if not existed:
+                db().execute('INSERT INTO course_teachers(course_id, teacher_id, imported_at) VALUES(?,?,?)',
+                             (c['id'], tid, now_str()))
                 linked += 1
-            elif not row:
-                pass
+            elif changed:
+                updated += 1
             else:
                 dups.append(name)
+        previous = [r['teacher_id'] for r in db().execute(
+            'SELECT teacher_id FROM course_teachers WHERE course_id=? ORDER BY import_order,id', (c['id'],)).fetchall()]
+        imported = set(ordered_ids)
+        ordered_ids.extend(tid for tid in previous if tid not in imported)
+        for position, tid in enumerate(ordered_ids, 1):
+            db().execute('UPDATE course_teachers SET import_order=? WHERE course_id=? AND teacher_id=?',
+                         (position, c['id'], tid))
         db().commit()
-    msg = '导入完成：新增教师 %d 人，加入本课程 %d 人，更新 %d 条' % (added, linked, updated)
-    if dups:
-        msg += '；已在名单中 %d 人（%s%s）' % (len(dups), '、'.join(dups[:3]), '…' if len(dups) > 3 else '')
+    msg = ('本次导入：读取 %d 行，加入本课程 %d 人，更新已有名单 %d 人，跳过 %d 行，异常 %d 行；'
+           '本次加入人员中新建教师档案 %d 人。教师顺序已按本次文件排列，文件外的原名单教师保留在末尾。'
+           % (len(rows), linked, updated, len(dups), len(errors), added))
     if errors:
-        msg += '；%d 行有问题（%s）' % (len(errors), '；'.join(errors[:3]))
-    return {'added': added, 'linked': linked, 'updated': updated,
-            'duplicates': dups, 'errors': errors, 'message': msg}
+        msg += ' 问题：' + '；'.join(errors[:3])
+    return {'total': len(rows), 'added': added, 'linked': linked, 'updated': updated,
+            'skipped': len(dups), 'duplicates': dups, 'errors': errors, 'message': msg}
 
 
 def add_teacher(course_no, employee_no, name):
@@ -1102,6 +1109,11 @@ def add_teacher(course_no, employee_no, name):
                                (c['id'], tid)).fetchone()
         db().execute('INSERT OR IGNORE INTO course_teachers(course_id, teacher_id, imported_at) '
                      'VALUES(?,?,?)', (c['id'], tid, now_str()))
+        if not existed:
+            position = db().execute('SELECT COALESCE(MAX(import_order),0)+1 AS position FROM course_teachers WHERE course_id=?',
+                                    (c['id'],)).fetchone()['position']
+            db().execute('UPDATE course_teachers SET import_order=? WHERE course_id=? AND teacher_id=?',
+                         (position, c['id'], tid))
         db().commit()
     if renamed:
         msg = '工号「%s」原登记姓名为「%s」，已按本次姓名改为「%s」%s' % (
@@ -1153,8 +1165,9 @@ def export_result(course_no):
     rows = db().execute(
         'SELECT t.name AS teacher, t.employee_no, c.campus, c.college, c.name AS cls, c.major, c.grade, '
         'c.plan_size, s.note, s.created_at FROM selections s JOIN classes c ON c.id=s.class_id '
-        'JOIN teachers t ON t.id=s.teacher_id WHERE s.course_id=? '
-        'ORDER BY t.name, c.campus, c.name', (cid,)).fetchall()
+        'JOIN teachers t ON t.id=s.teacher_id '
+        'JOIN course_teachers ct ON ct.teacher_id=t.id AND ct.course_id=s.course_id WHERE s.course_id=? '
+        'ORDER BY ct.import_order, ct.id, c.campus, c.name', (cid,)).fetchall()
     left = db().execute(
         'SELECT c.campus, c.college, c.name AS cls, c.major, c.grade, c.plan_size FROM classes c '
         'WHERE c.course_id=? AND NOT EXISTS (SELECT 1 FROM selections s WHERE s.class_id=c.id) '
@@ -1166,7 +1179,7 @@ def export_result(course_no):
         ' WHERE s.course_id=? AND s.teacher_id=t.id) students, '
         '(SELECT tn.note FROM teacher_notes tn WHERE tn.course_id=? AND tn.teacher_id=t.id) note '
         'FROM teachers t JOIN course_teachers ct ON ct.teacher_id=t.id AND ct.course_id=? '
-        'ORDER BY n DESC, t.name', (cid, cid, cid, cid)).fetchall()
+        'ORDER BY ct.import_order, ct.id', (cid, cid, cid, cid)).fetchall()
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1214,7 +1227,7 @@ def export_teachers_list(course_no):
         ' WHERE s.course_id=? AND s.teacher_id=t.id) students, '
         '(SELECT tn.note FROM teacher_notes tn WHERE tn.course_id=? AND tn.teacher_id=t.id) note '
         'FROM teachers t JOIN course_teachers ct ON ct.teacher_id=t.id AND ct.course_id=? '
-        'ORDER BY n DESC, t.name', (c['id'], c['id'], c['id'], c['id'])).fetchall()
+        'ORDER BY ct.import_order, ct.id', (c['id'], c['id'], c['id'], c['id'])).fetchall()
     for r in rows:
         ws.append([r['employee_no'], r['name'], r['n'], r['students'],
                    '已选班' if r['n'] > 0 else '未选班', r['note'] or ''])
