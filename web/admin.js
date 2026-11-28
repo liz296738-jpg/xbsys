@@ -521,11 +521,19 @@ $('#resetBtn').onclick = async () => {
     await refresh();
   } catch (e) { toast(e.message, 'err'); }
 };
-$('#resetCourseBtn').onclick = async () => {
-  if (!confirm('确定清空本课程的班级、教师名单与选班记录吗？课程本身保留。')) return;
+$('#resetClassesBtn').onclick = async () => {
+  if (!confirm('确定清空本课程的全部班级吗？相关选班记录也会删除，教师名单和情况说明保留。')) return;
   try {
-    await postJSON('/api/admin/reset_course', { course_no: courseNo() });
-    toast('已清空本课程数据', 'ok');
+    await postJSON('/api/admin/reset_classes', { course_no: courseNo() });
+    toast('已清空本课程班级，教师名单已保留', 'ok');
+    await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
+$('#resetTeachersBtn').onclick = async () => {
+  if (!confirm('确定清空本课程的教师名单吗？相关选班记录和情况说明也会删除，班级保留。其他课程的教师名单不受影响。')) return;
+  try {
+    await postJSON('/api/admin/reset_teachers', { course_no: courseNo() });
+    toast('已清空本课程教师名单，班级已保留', 'ok');
     await refresh();
   } catch (e) { toast(e.message, 'err'); }
 };

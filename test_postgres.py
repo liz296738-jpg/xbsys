@@ -80,6 +80,27 @@ def main():
         assert snapshot.startswith('PostgreSQL 启动快照 #')
         saved = conn.execute('SELECT payload FROM startup_snapshots ORDER BY id DESC LIMIT 1').fetchone()['payload']
         assert any(c['course_no'] == course_no for c in saved['courses'])
+        # Only disposable fixture rows are cleared; every operation is rolled back.
+        conn.execute('INSERT INTO course_teachers(course_id,teacher_id,imported_at) VALUES(?,?,?)',
+                     (other_id, tid, app.now_str()))
+        app.select_classes(course_no, suffix, '部署检查教师', ids)
+        app.select_classes(course_no, suffix, '部署检查教师', [], '临时说明')
+        app.reset_course_classes(course_no)
+        assert conn.execute('SELECT 1 FROM classes WHERE course_id=?', (cid,)).fetchone() is None
+        assert conn.execute('SELECT 1 FROM selections WHERE course_id=?', (cid,)).fetchone() is None
+        assert conn.execute('SELECT 1 FROM course_teachers WHERE course_id=?', (cid,)).fetchone()
+        assert app.my_selections(course_no, suffix, '部署检查教师')['teacher_note'] == '临时说明'
+        kept_id = conn.execute('INSERT INTO classes(course_id,college,name,plan_size,major,grade,campus) VALUES(?,?,?,?,?,?,?)',
+                               (cid, '测试学院', '保留班级', 10, '测试', '2026', '测试校区')).lastrowid
+        conn.execute('INSERT INTO selections(course_id,class_id,teacher_id,note,created_at) VALUES(?,?,?,?,?)',
+                     (cid, kept_id, tid, '', app.now_str()))
+        app.reset_course_teachers(course_no)
+        assert conn.execute('SELECT 1 FROM classes WHERE course_id=?', (cid,)).fetchone()
+        assert conn.execute('SELECT 1 FROM course_teachers WHERE course_id=?', (cid,)).fetchone() is None
+        assert conn.execute('SELECT 1 FROM teacher_notes WHERE course_id=?', (cid,)).fetchone() is None
+        assert conn.execute('SELECT 1 FROM selections WHERE course_id=?', (cid,)).fetchone() is None
+        assert conn.execute('SELECT 1 FROM teachers WHERE id=?', (tid,)).fetchone()
+        assert conn.execute('SELECT 1 FROM course_teachers WHERE course_id=? AND teacher_id=?', (other_id, tid)).fetchone()
         conn.rollback()
         assert conn.execute('SELECT 1 FROM courses WHERE course_no=?', (course_no,)).fetchone() is None
         print('PostgreSQL integration checks passed: note-only submissions and Excel exports, note clearing after selection, course authorization, startup snapshots, selection rules, login history and rollback.', flush=True)

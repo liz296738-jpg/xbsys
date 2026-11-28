@@ -1262,6 +1262,27 @@ def reset_course_selections(course_no):
     return {'ok': True}
 
 
+def reset_course_classes(course_no):
+    """清空当前课程的班级及其选班记录，保留教师名单和情况说明。"""
+    c = require_course(course_no)
+    with LOCK:
+        db().execute('DELETE FROM selections WHERE course_id=?', (c['id'],))
+        db().execute('DELETE FROM classes WHERE course_id=?', (c['id'],))
+        db().commit()
+    return {'ok': True}
+
+
+def reset_course_teachers(course_no):
+    """清空当前课程的教师名单、选班记录和情况说明，保留班级。"""
+    c = require_course(course_no)
+    with LOCK:
+        db().execute('DELETE FROM selections WHERE course_id=?', (c['id'],))
+        db().execute('DELETE FROM teacher_notes WHERE course_id=?', (c['id'],))
+        db().execute('DELETE FROM course_teachers WHERE course_id=?', (c['id'],))
+        db().commit()
+    return {'ok': True}
+
+
 def reset_course(course_no):
     """清空该课程的班级、教师名单与选班记录（课程本身保留）"""
     c = require_course(course_no)
@@ -1516,6 +1537,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/admin/reset':
             c = require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **reset_course_selections(c['course_no'])})
+        if path == '/api/admin/reset_classes':
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
+            return self._json({'ok': True, **reset_course_classes(c['course_no'])})
+        if path == '/api/admin/reset_teachers':
+            c = require_admin(payload.get('course_no'), payload.get('admin_token'))
+            return self._json({'ok': True, **reset_course_teachers(c['course_no'])})
         if path == '/api/admin/reset_course':
             c = require_admin(payload.get('course_no'), payload.get('admin_token'))
             return self._json({'ok': True, **reset_course(c['course_no'])})

@@ -261,10 +261,11 @@
         <div class="toolbar" style="margin-bottom:24px">
           <button class="btn primary" id="exportBtn">导出 Excel</button>
         </div>
-        <div class="hint">以下操作只影响当前课程，请谨慎使用。清空选班只删除选班记录，班级和教师名单保留。</div>
+        <div class="hint">以下操作只影响当前课程，请谨慎使用。清空选班仅删除选班记录；清空班级会同时删除选班记录、保留教师名单；清空教师名单会同时删除选班记录和情况说明、保留班级。</div>
         <div class="toolbar">
           <button class="btn danger" id="resetBtn">清空本课程选班记录</button>
-          <button class="btn danger" id="resetCourseBtn">清空本课程班级与教师名单</button>
+          <button class="btn danger" id="resetClassesBtn">清空本课程班级</button>
+          <button class="btn danger" id="resetTeachersBtn">清空本课程教师名单</button>
         </div>
       </div>
     </div>
