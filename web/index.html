@@ -2,10 +2,11 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>教师选班系统</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body class="teacher-page">
 <div class="toast-wrap" id="toasts"></div>
 
 <div class="header">
@@ -44,8 +45,9 @@
 
 <div class="wrap" id="mainBox" style="display:none">
   <div class="hint" id="ruleHint"></div>
+  <nav class="mobile-module-nav" aria-label="选班模块导航"><a class="btn" href="#availableClassesPanel">可选班级</a><a class="btn primary" href="#myClassesPanel">我的选班</a></nav>
   <div class="layout">
-    <div class="card">
+    <section class="card" id="availableClassesPanel" aria-label="可选班级">
       <div class="card-head">
         <h2>可选班级</h2>
         <div class="toolbar">
@@ -63,7 +65,8 @@
           <button class="btn" id="refreshBtn">刷新</button>
         </div>
       </div>
-      <div class="scroll">
+      <p class="table-scroll-hint">上下滑动浏览班级，左右滑动查看全部列</p>
+      <div class="scroll class-table-scroll" id="classScroll" tabindex="0" role="region" aria-label="可选班级表，可上下和左右滚动">
         <table>
           <thead>
             <tr>
@@ -76,6 +79,7 @@
         </table>
         <div class="empty" id="classEmpty" style="display:none">没有符合条件的班级</div>
       </div>
+      <label class="table-scroll-controls" id="classScrollControls" hidden><span>左右滚动</span><input type="range" id="classScrollRange" min="0" max="0" value="0" step="1" aria-label="左右滚动班级表"></label>
       <div class="submit-bar">
         <div class="info">已勾选 <b id="pickCount">0</b> 个班，合计 <b id="pickPeople">0</b> 人</div>
         <div class="toolbar">
@@ -84,9 +88,9 @@
         </div>
       </div>
       <div class="hint" id="noteHint" style="display:none;margin-top:10px"></div>
-    </div>
+    </section>
 
-    <div class="card">
+    <section class="card" id="myClassesPanel" aria-label="我的选班">
       <div class="card-head">
         <h2>我的选班</h2>
         <span class="muted" id="mineStats"></span>
@@ -99,7 +103,7 @@
         <div id="mineList"></div>
         <div class="empty" id="mineEmpty" style="display:none">还没有选择任何班级</div>
       </div>
-    </div>
+    </section>
   </div>
 </div>
 

@@ -202,6 +202,7 @@ function renderClasses() {
       </tr>`).join('');
   }
   updatePickBar();
+  syncClassScrollbar();
 }
 
 function renderMine() {
@@ -220,7 +221,7 @@ function renderMine() {
         <button class="btn sm danger unselect" data-id="${c.id}">撤销</button>
       </div>
       <div class="meta">${esc(c.college)} · ${esc(c.major)} · ${esc(c.grade)}级 · ${esc(c.campus)} · ${c.plan_size} 人</div>
-      <textarea class="note" data-id="${c.id}" placeholder="排课备注，例如：周二上午第 1-2 节，东 3-201">${esc(c.note || '')}</textarea>
+      <textarea class="note" data-id="${c.id}" placeholder="排课备注">${esc(c.note || '')}</textarea>
     </div>`).join('');
 }
 
@@ -335,3 +336,25 @@ $('#switchCourseBtn').addEventListener('click', () => {
     showLogin();
   }
 })();
+
+
+// Keep a draggable horizontal control available on touch devices with overlay scrollbars.
+function syncClassScrollbar() {
+  const area = $('#classScroll');
+  const slider = $('#classScrollRange');
+  const max = Math.max(0, area.scrollWidth - area.clientWidth);
+  $('#classScrollControls').hidden = max <= 1;
+  slider.max = String(max);
+  slider.value = String(Math.min(max, area.scrollLeft));
+}
+$('#classScrollRange').addEventListener('input', e => {
+  $('#classScroll').scrollLeft = Number(e.target.value);
+});
+$('#classScroll').addEventListener('scroll', syncClassScrollbar, { passive: true });
+window.addEventListener('resize', syncClassScrollbar);
+if (typeof ResizeObserver !== 'undefined') {
+  const classScrollObserver = new ResizeObserver(syncClassScrollbar);
+  classScrollObserver.observe($('#classScroll'));
+  classScrollObserver.observe($('#classScroll table'));
+}
+syncClassScrollbar();
